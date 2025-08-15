@@ -1,0 +1,13 @@
+Flask
+Flask-Cors
+pymongo
+python-dotenv
+google-api-python-client
+google-auth-oauthlib
+google-cloud-pubsub
+redis
+requests
+celery
+msal
+beautifulsoup4
+gevent

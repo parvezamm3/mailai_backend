@@ -1,0 +1,731 @@
+import json
+import requests
+import time
+from bs4 import BeautifulSoup
+from flask import Blueprint, request, jsonify, send_file
+from database import preferences_collection, users_collection, inbox_messages_collection, draft_messages_collection, inbox_conversations_collection
+from utils.outlook_utils import load_outlook_credentials, get_outlook_message_details_graph, send_outlook_reply_graph, get_application_access_token, get_outlook_access_token
+from utils.transform_utils import decode_conversation_index, convert_utc_to_local
+from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
+from utils.gmail_utils import load_google_credentials
+from workers.tasks import generate_attachment_summary, generate_previous_emails_summary, generate_importance_analysis, generate_summary_and_replies
+from config import Config
+from pprint import pprint
+
+
+add_on_bp = Blueprint('add_on_bp', __name__)
+
+@add_on_bp.route('/dashboard_data', methods=['POST'])
+def get_dashboard_data():
+    """
+    Provides initial analysis and user preferences based on email content.
+    Now supports both Gmail and Outlook message details.
+    """
+    if not request.is_json:
+        return jsonify({"status": "error", "message": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    user_id = data.get('user_id')
+    message_id = data.get('message_id').replace('/', '-') # New: for Outlook messages
+
+    if not user_id:
+        return jsonify({"status": "error", "message": "User ID is required"}), 400
+    
+    print(f"Received request for user: {user_id} and Message: {message_id}")
+    platform = data.get('platform')
+    if platform=='gmail':
+        creds, history =load_google_credentials(user_id)
+        print(creds)
+        if not creds:
+            print(f"Token for user {user_id} has expired. Sending 401.")
+            return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
+        
+    if platform=='outlook':
+        creds = load_outlook_credentials(user_id)
+        if not creds:
+            print(f"Token for user {user_id} has expired. Sending 401.")
+            return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
+
+    print(f"Credentials for user {user_id} are valid.")
+    # --- 1. Get or Create User Preferences from MongoDB ---
+    user_pref_doc = preferences_collection.find_one({'user_id': user_id})
+    if not user_pref_doc:
+        print(f"Creating new preferences for user: {user_id} in MongoDB")
+        default_prefs = {
+            'user_id': user_id,
+            'enable_importance': True,
+            'enable_confidential_detection': True
+        }
+        preferences_collection.insert_one(default_prefs)
+        user_pref_doc = default_prefs # Use the newly created defaults
+    
+    preferences = {
+        'enable_importance': user_pref_doc.get('enable_importance', False),
+        'enable_confidential_detection': user_pref_doc.get('enable_confidential_detection', False)
+    }
+    analysis_result = "Analysis loading..."
+    # from database import messages_collection # Import here to avoid circular if already in utils
+    print('Message Loading')
+    message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
+    print("Message Loaded")
+    if message_doc and 'analysis' in message_doc:
+        analysis_data = message_doc['analysis']
+        importance_score = analysis_data.get('importance_score')
+        importance_description = analysis_data.get('importance_description')
+        category = analysis_data.get('category')
+        
+        analysis_result = f"Importance: {importance_score or 'N/A'} - {importance_description or 'Loading...'}\nCategory: {category or 'Loading...'}"
+
+    return jsonify({
+        "status": "success",
+        "analysis_result": analysis_result,
+        "preferences": preferences,
+    })
+
+@add_on_bp.route('/save_preferences', methods=['POST'])
+def save_preferences():
+    """Saves user preferences to MongoDB."""
+    if not request.is_json:
+        return jsonify({"status": "error", "message": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    user_id = data.get('user_id')
+    enable_importance = data.get('enable_importance')
+    enable_confidential_detection = data.get('enable_confidential_detection')
+
+    if not user_id:
+        return jsonify({"status": "error", "message": "User ID is required"}), 400
+
+    update_data = {
+        'enable_importance': enable_importance,
+        'enable_confidential_detection': enable_confidential_detection
+    }
+
+    preferences_collection.update_one(
+        {'user_id': user_id},
+        {'$set': update_data},
+        upsert=True
+    )
+    print(f"Preferences saved for user {user_id}: {update_data}")
+
+    return jsonify({
+        "status": "success",
+        "message": "Preferences updated",
+        "preferences": update_data
+    })
+
+
+@add_on_bp.route('/suggest_reply', methods=['POST'])
+def suggest_reply():
+    """
+    Receives email content and returns 2-3 suggested replies.
+    Now supports both Gmail and Outlook contexts.
+    """
+    if not request.is_json:
+        return jsonify({"status": "error", "message": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    user_id = data.get('user_id')
+    message_id = data.get('message_id').replace('/', '-') # From Outlook context
+
+
+    if not user_id:
+        return jsonify({"status": "error", "message": "User ID is required"}), 400
+
+    # print(f"Message id : {message_id} User Id:{user_id}")
+    message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
+    # print(message_doc)
+    
+    suggested_replies = []
+    if message_doc and 'analysis' in message_doc:
+        replies_from_db = message_doc['analysis'].get('suggested_replies', [])
+        if replies_from_db:
+            suggested_replies = replies_from_db
+            # print(f"Fetched replies from DB for {message_id}.")
+        else:
+            print(f"Replies not yet generated for {message_id}. Attempting fallback dummy replies.")
+            # Fallback if replies aren't in DB yet (tasks still running)
+            suggested_replies = [
+                f"Thank you for your email.",
+                f"I'll get back to you shortly.",
+                f"Acknowledged."
+            ]
+    else:
+        print(f"Message {message_id} not found in DB or analysis missing. Generating dummy replies.")
+        # Fallback if message not found or no analysis field
+        suggested_replies = [
+            f"Thank you for your email.",
+            f"I'll get back to you shortly.",
+            f"Acknowledged."
+        ]
+    
+    return jsonify({
+        "status": "success",
+        "suggested_replies": suggested_replies
+    })
+
+@add_on_bp.route('/send_outlook_reply', methods=['POST'])
+def send_outlook_reply():
+    """
+    Receives selected reply and sends it via Microsoft Graph API.
+    """
+    if not request.is_json:
+        return jsonify({"status": "error", "message": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    user_id = data.get('user_id')
+    original_message_id = data.get('original_message_id')
+    reply_body = data.get('reply_body')
+
+    if not all([user_id, original_message_id, reply_body]):
+        return jsonify({"status": "error", "message": "Missing required fields for sending reply"}), 400
+
+    outlook_access_token = load_outlook_credentials(user_id)
+    if not outlook_access_token:
+        return jsonify({"status": "error", "message": "Outlook user not authorized or token expired."}), 401
+
+    if send_outlook_reply_graph(outlook_access_token, original_message_id, reply_body):
+        return jsonify({"status": "success", "message": "Reply sent via Outlook Graph API."})
+    else:
+        return jsonify({"status": "error", "message": "Failed to send reply via Outlook Graph API. Check backend logs."}), 500
+
+
+@add_on_bp.route('/emails', methods=['GET'])
+def get_emails():
+    conversations = []
+
+    # Fetch all conversations
+    for conv_doc in inbox_conversations_collection.find({}, {'_id': 0}):
+        conv_id = conv_doc.get('conv_id')
+        subject = conv_doc.get('subject', '')
+        email_address = conv_doc.get('email_address', '')
+        messages_out = []
+
+        for msg in conv_doc.get('messages', []):
+            attachments_out = []
+            for attach in msg.get('attachments', []):
+                attachments_out.append({
+                    'id': attach.get('id'),
+                    'name': attach.get('name'),
+                    'contentType': attach.get('contentType'),
+                    'size': attach.get('size'),
+                    'isInline': attach.get('isInline', False),
+                    'summary':attach.get('attachment_summary', '')
+                    # ⚠ Don’t send contentBytes here unless explicitly requested
+                })
+
+            messages_out.append({
+                'message_id': msg.get('message_id'),
+                'conv_id': conv_doc.get('conv_id'),
+                'email_address':conv_doc.get('email_address', ''),
+                'subject': msg.get('subject'),
+                'conv_index': msg.get('conv_index'),
+                'child_replies': msg.get('child_replies'),
+                'sender': msg.get('sender'),
+                'receivers': msg.get('receivers'),
+                'cc': msg.get('cc'),
+                'bcc': msg.get('bcc'),
+                'body': msg.get('body'),
+                'webLink': msg.get('webLink'),
+                'received_time': msg.get('received_time'),
+                'attachments': attachments_out,
+                'type': msg.get('type')
+            })
+
+        # Sort messages by received_time if present
+        messages_out.sort(key=lambda m: m.get('received_time') or '', reverse=False)
+
+        conversations.append({
+            'conv_id': conv_id,
+            'email_address': email_address,
+            'subject': subject,
+            'messages': messages_out
+        })
+    # print(conversations)
+
+    return jsonify({
+        "status": "success",
+        "conversations": conversations
+    })
+# @add_on_bp.route('/emails', methods=['GET'])
+# def get_emails():
+#     """
+#     Fetches a list of saved emails from the database.
+#     """
+#     emails = []
+#     count = 0
+#     for doc in inbox_messages_collection.find({}, {'_id': 0, 'message_id': 1, 'subject': 1, 'sender': 1, 'email_address': 1, 'type': 1, 'analysis': 1, 'body':1, "receivers":1, "email_address":1, "history":1}):
+#         count+=1
+#         emails.append(doc)
+    
+#     return jsonify({"status": "success", "emails": emails})
+
+@add_on_bp.route('/trigger_analysis/<string:conv_id>/<string:message_id>/<string:user_id>/<string:analysis_type>', methods=['POST'])
+def trigger_analysis(conv_id, message_id, user_id, analysis_type):
+    """
+    Triggers a specific analysis task for a given email.
+    """
+    print(conv_id[:10], message_id[:10], user_id)
+    # import workers.tasks as tasks
+    if analysis_type == 'importance':
+        generate_importance_analysis.delay(conv_id, message_id, user_id)
+        message = f"Importance analysis triggered for message {message_id}."
+    elif analysis_type == 'summary_replies':
+        generate_summary_and_replies.delay(conv_id, message_id, user_id)
+        message = f"Summary and replies generation triggered for message {message_id}."
+    # elif analysis_type == 'categorization':
+    #     tasks.generate_category_task(message_id, user_id)
+    #     message = f"Categorization triggered for message {message_id}."
+    else:
+        return jsonify({"status": "error", "message": "Invalid analysis type."}), 400
+    
+    return jsonify({"status": "success", "message": message})
+
+@add_on_bp.route('/email_analysis/<string:conv_id>/<string:message_id>/<string:user_id>', methods=['GET'])
+def get_email_analysis(conv_id, message_id, user_id):
+    """
+    Fetches the latest analysis results for a specific email.
+    """
+    print("Get Email Analysis")
+    # email_doc = inbox_messages_collection.find_one(
+    #     {'message_id': message_id, 'email_address': user_id},
+    #     {'_id': 0, 'analysis': 1} # Only return the analysis field
+    # )
+    # print(email_doc)
+
+    current_message_doc = inbox_conversations_collection.find_one(
+        {'conv_id': conv_id, "email_address":user_id, 'messages.message_id': message_id},
+        {'_id': 0, 'messages.$': 1}
+    )
+    current_message = current_message_doc['messages'][0]
+    
+    if current_message and 'analysis' in current_message:
+        print("Pooling Analysis")
+        print(current_message['analysis'])
+        return jsonify({"status": "success", "analysis": current_message['analysis']})
+    else:
+        return jsonify({"status": "not_found", "message": "Analysis not found or not yet completed."}), 200
+        # return jsonify({"status": "not_found", "message": "Analysis not found or not yet completed."}), 404
+
+
+import re
+# def extract_email_thread(body_plain_text):
+#     """
+#     Extracts the latest message and previous conversation from an email thread.
+
+#     Args:
+#         body_plain_text (str): The plain text content of the email body.
+
+#     Returns:
+#         tuple: A tuple containing the latest message (str) and the previous conversation (str).
+#                Returns ("full_body", "") if no separator is found.
+#     """
+#     # This regex pattern looks for the standard Outlook separator line, which typically
+#     # starts with "From:". It is case-insensitive and works across multiple lines.
+#     separator_pattern = re.compile(r'^\s*(Subject:|件名:)\s*(Re:|RE:|Fwd:|FW:|転送:).*', re.MULTILINE | re.IGNORECASE)
+
+#     # Search for the first instance of the separator
+#     match = separator_pattern.search(body_plain_text)
+#     print("Body Plain Text")
+#     print(body_plain_text)
+#     print(match)
+
+#     if match:
+#         # The latest message is all the content *before* the first separator
+#         latest_message = body_plain_text[:match.start()].strip()
+#         # The previous conversation is all the content *from* the separator onward
+#         previous_conversation = body_plain_text[match.start():].strip()
+#     else:
+#         # If no separator is found, the entire body is treated as the latest message
+#         latest_message = body_plain_text.strip()
+#         previous_conversation = ""
+
+#     return latest_message, previous_conversation
+
+# def extract_email_thread(text, delim1, delim2):
+#     pattern = re.compile(f"({re.escape(delim1)}|{re.escape(delim2)})")
+#     match = pattern.search(text)
+#     if match:
+#         split_point = match.start()
+#         # print(split_point)
+#         delimiter_length = len(match.group(0))
+#         return [text[:split_point], text[split_point + delimiter_length:]]
+#     else:
+#         return [text]
+
+@add_on_bp.route('/sync_all_mail_history', methods=['POST'])
+def sync_all_mail():
+    try:
+        data = request.get_json()
+        email_address = data.get('email_address')
+        operator = data.get('operator')
+        mailType = data.get('mailType')
+        # print(email_address, operator, mailType)
+        if operator=="Outlook":
+            user_data = users_collection.find_one({'user_id': email_address})
+            account_type = user_data.get('account_type')
+            access_token = ""
+            # api_endpoint = ''
+            mail_folders_endpoint = ''
+            
+            if account_type=="licensed":
+                access_token = get_outlook_access_token(email_address)
+                # api_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/me/mailfolders('inbox')/messages?$orderby=receivedDateTime desc"
+                mail_folders_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/me/mailFolders"
+            elif account_type=="unlicensed":
+                access_token = get_application_access_token()
+                # api_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/mailfolders('inbox')/messages?$orderby=receivedDateTime desc"
+                mail_folders_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/mailFolders('inbox')/childFolders"
+            else:
+                return jsonify({"error": "Unknown account type"}), 400
+        
+            headers = {
+                        'Authorization': f'Bearer {access_token}',
+                        'Content-Type': 'application/json'
+                    }
+
+            all_messages = []
+            
+            next_folders_link = mail_folders_endpoint
+            while next_folders_link:
+                folders_resp = requests.get(next_folders_link, headers=headers)
+                folders_resp.raise_for_status()
+                folders = folders_resp.json().get('value', [])
+            
+                for folder in folders:
+                    folder_id = folder.get('id')
+                    folder_display_name = folder.get('displayName')
+                    if folder_display_name=="緊急度高":
+                        messages_endpoint = f"{mail_folders_endpoint}/'{folder_id}'/messages?$select=conversationId,subject&$orderby=receivedDateTime desc"
+                        next_link = messages_endpoint
+                        
+                        while next_link:
+                            resp = requests.get(next_link, headers=headers)
+                            resp.raise_for_status()
+                            response_data = resp.json()
+                            
+                            conversations = response_data.get('value', [])
+                            print(len(conversations))
+                            
+                            for conv in conversations[8:11]:
+                                conversation_id = conv.get('conversationId')
+                                # subject = conv.get('subject', 'N/A')
+                                # print("------------Conversation-------------------")
+                                # print(conversation_id, subject)
+                                inbox_conversations_collection.update_one
+                                conversation_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages?$filter=conversationId eq '{conversation_id}'"
+                                conv_resp = requests.get(conversation_endpoint, headers=headers)
+                                conv_resp.raise_for_status()
+                                conv_response_data = conv_resp.json()
+                                
+                                conv_messages = conv_response_data.get('value', [])
+                                messages = []
+                                # count = 0
+                                for msg in conv_messages:
+                                    # print(msg)
+                                    # print('-----------------Message---------------')
+                                    message_id = msg.get('id')
+                                    msg_subject = msg.get('subject')
+                                    # print(message_id, msg_subject)
+                                    msg_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages/{message_id}?$select=uniqueBody"
+                                    single_msg_resp = requests.get(msg_endpoint, headers=headers)
+                                    single_msg_resp.raise_for_status()
+                                    single_msg_data = single_msg_resp.json()
+                                    # print(single_msg_data.get("uniqueBody", {}))
+
+                                    conv_index = msg.get('conversationIndex')
+                                    number_of_child_replies = decode_conversation_index(msg.get('conversationIndex')).get("number of replies", '')
+                                    sender_info = msg.get('sender', {}).get('emailAddress', {})
+                                    sender = sender_info.get('address', 'N/A')
+                                    receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
+                                    receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
+                                    cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('ccRecipients', [])]
+                                    bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('bccRecipients', [])]
+                                    # body_content = msg.get('body')
+                                    body_content = single_msg_data.get("uniqueBody", {})
+                                    cleaned_body = get_unique_body_outlook(body_content)
+                                    inline_attachments = get_inline_attachments_outlook(body_content)
+                                    attachments_data = []
+                                    # print(msg.get('hasAttachments'))
+                                    if msg.get('hasAttachments') or len(inline_attachments)>0:
+                                        # print(f"Message {message_id[:10]} has attachments. Fetching attachment details...")
+                                        attachments_url = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages/{message_id}/attachments"
+                                        try:
+                                            attachments_resp = requests.get(attachments_url, headers=headers)
+                                            attachments_resp.raise_for_status()
+                                            fetched_attachments = attachments_resp.json().get('value', [])
+                                            
+                                            for attach in fetched_attachments:
+                                                # Only store relevant fields and contentBytes if available
+                                                attachment_info = {
+                                                    'id': attach.get('id'),
+                                                    'name': attach.get('name'),
+                                                    'contentType': attach.get('contentType'),
+                                                    'size': attach.get('size'),
+                                                    'isInline': attach.get('isInline', False),
+                                                    'contentBytes': attach.get('contentBytes') 
+                                                }
+                                                attachments_data.append(attachment_info)
+                                            # print(f"  Fetched {len(attachments_data)} attachment details for message {message_id}.")
+                                        except requests.exceptions.RequestException as attach_e:
+                                            print(f"  Error fetching attachments for message {message_id}: {attach_e}")
+                                            if attach_e.response:
+                                                print(f"  Attachment fetch error response: {attach_e.response.text}")
+                                    received_time = convert_utc_to_local(msg.get('receivedDateTime', {}))
+                                    
+                                    message_doc = {
+                                        'message_id': message_id,
+                                        'subject':msg_subject,
+                                        'conv_index':conv_index,
+                                        "child_replies":number_of_child_replies,
+                                        'sender': sender,
+                                        'receivers': receivers_list,
+                                        'cc': cc_list,
+                                        'bcc': bcc_list,
+                                        'body': cleaned_body,
+                                        'full_message_payload': conv,
+                                        'webLink': conv.get('webLink'),
+                                        'received_time':received_time,
+                                        'attachments':attachments_data,
+                                        'type':'outlook_received_mail'
+                                    }
+                                    messages.append(message_doc)
+                                conv_doc = {
+                                    'conv_id': conversation_id, 
+                                    'email_address': email_address, 
+                                    'messages':messages
+                                }
+                                inbox_conversations_collection.update_one(
+                                    {'conv_id': conversation_id},
+                                    {'$set': conv_doc},
+                                    upsert=True
+                                )
+                                for message in messages:
+                                    if 'ffp.co.jp' not in message.get('sender'):
+                                        attachments = message.get('attachments')
+                                        if len(attachments)>0:
+                                            generate_attachment_summary.delay(conversation_id, message.get('message_id'), email_address, 'outlook')
+                                        generate_previous_emails_summary.delay(conversation_id, message.get('message_id'), email_address)
+                            all_messages.extend(conversations)
+                            
+                            # Check for the next page link
+                            next_link = response_data.get('@odata.nextLink')
+
+                        # print(f"Total messages fetched from all folders: {len(all_messages)}")
+                next_folders_link = folders_resp.json().get('@odata.nextLink')
+
+
+        return jsonify({"status": "success", "message": f"Full mail sync initiated for {email_address}"}), 200
+    except requests.exceptions.RequestException as e:
+        print(f"Error syncing mail history: {e}")
+        return jsonify({"error": f"API request error: {e}"}), 500
+    except Exception as e:
+        print(f"Error during full mail sync request: {e}")
+        return jsonify({"status": "error", "message": f"Internal server error: {e}"}), 500
+
+@add_on_bp.route('/process_draft', methods=['POST'])
+def save_draft():
+    """
+    Receives draft data from the Apps Script, saves it as a new document
+    in the MongoDB 'drafts' collection, and returns the inserted ID.
+    """
+    try:
+        # Get the JSON data from the request body
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Extract the necessary fields. These will become fields in our MongoDB document.
+        message_id = data.get('message_id')
+        sender = data.get('sender')
+        receiver = data.get('receiver')
+        subject = data.get('subject')
+        contents = data.get('contents')
+        drafts_at = data.get('drafts_at')
+        
+        # Validate that all required fields are present
+        if not all([receiver, subject, contents]):
+            return jsonify({'error': 'Missing required fields: recipient, subject, or body'}), 400
+
+        # Create a document to insert into MongoDB
+        insert_result = draft_messages_collection.insert_one(
+            {'message_id': message_id, 'sender': sender,
+                            'receiver': receiver,
+                            'subject': subject,
+                            'contents': contents,
+                            'drafts_at': drafts_at,},
+        )
+        
+        # Return a success message with the ID of the new document
+        return jsonify({
+            'message': 'Draft saved successfully',
+            'saved_draft_id': str(insert_result.inserted_id), # Convert ObjectId to a string
+            'data_received': data
+        }), 201
+
+    except Exception as e:
+        # Handle any unexpected errors
+        print(f"Error in save_draft: {e}")
+        return jsonify({'error': 'An internal server error occurred'}), 500
+
+import xlsxwriter
+import io
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import pytz
+@add_on_bp.route('/download_excel', methods=['GET'])
+def download_excel():
+    # Create an in-memory buffer to hold the Excel data
+    output = io.BytesIO()
+    workbook  = xlsxwriter.Workbook(output, {'in_memory': True})
+    worksheet = workbook.add_worksheet()
+    worksheet.set_column("A:Z", 30)
+    # Define cell formats if needed
+    header_format = workbook.add_format({
+        'align': 'center',
+        'valign': 'vcenter',
+        'bold':True,
+        "text_wrap":True
+    })
+    cell_format_center = workbook.add_format({
+        'align': 'center',
+        'valign': 'vcenter',
+        "text_wrap":True
+    })
+    cell_format_left = workbook.add_format({
+        'align': 'center',
+        'valign': 'vcenter',
+        "text_wrap":True
+    })
+
+    # Set up the headers with merged cells
+    worksheet.merge_range('A1:A2', 'スレッドの件名', header_format)
+    worksheet.merge_range('B1:B2', '受信時刻', header_format)
+    worksheet.merge_range('C1:C2', 'メールの件名', header_format)
+    worksheet.merge_range('D1:D2', '送信者', header_format)
+    worksheet.merge_range('E1:F2', '本文', header_format)
+    worksheet.merge_range('G1:H1', '添付ファイル', header_format)
+    worksheet.write('G2', 'ファイル名', header_format)
+    worksheet.write('H2', '概要', header_format)
+    worksheet.merge_range('I1:I2', '過去のメール概要', header_format)
+    worksheet.merge_range('J1:N1', '分析', header_format)
+    worksheet.write('J2', '重要度スコアと理由', header_format)
+    worksheet.write('K2', '概要', header_format)
+    worksheet.merge_range('L2:M2', '返信', header_format)
+    worksheet.write('N2', 'カテゴリ', header_format)
+
+
+    pipeline = [
+            # Stage 1: Deconstruct the messages array.
+            # This creates a new document for each element in the messages array.
+            {"$unwind": "$messages"},
+
+            # Stage 2: Sort the deconstructed documents.
+            # We sort by conv_id to keep messages from the same conversation together,
+            # and then by the nested received_time to order them chronologically.
+            {"$sort": {"conv_id": 1, "messages.received_time": 1}},
+
+            # Stage 3: Reconstruct the original document structure.
+            # We group by the original document's _id to put the messages back together.
+            {"$group": {
+                "_id": "$_id",
+                "conv_id": {"$first": "$conv_id"},
+                "subject": {"$first": "$subject"},
+                "messages": {"$push": "$messages"}
+            }},
+
+            # Stage 4: (Optional) Project the final document to the desired format if needed.
+            # This can be used to re-arrange or hide fields.
+            # {"$project": {
+            #     "_id": 0,
+            #     "conv_id": 1,
+            #     "email_address": 1,
+            #     "subject": 1,
+            #     "messages": 1
+            # }}
+        ]
+
+    # all_conversations = list(inbox_conversations_collection.find({}))
+    all_conversations = list(inbox_conversations_collection.aggregate(pipeline))
+    
+    start_row=3
+    end_row = 3
+    for doc in all_conversations:
+        messages = doc.get('messages')
+        msg_start = start_row
+        msg_end = end_row
+        for message in messages:
+            attachments = message.get('attachments', [])
+            for attachment in attachments:
+                worksheet.write('G'+str(msg_end), attachment.get('name'), cell_format_center)
+                worksheet.write('H'+str(msg_end), attachment.get('attachment_summary'), cell_format_left)
+                msg_end+=1
+            analysis = message.get('analysis', {})
+            without_tz_str =  message.get('received_time').strftime("%Y-%m-%d %H:%M:%S")
+            without_tz = datetime.strptime(without_tz_str, "%Y-%m-%d %H:%M:%S")
+            original_tz = pytz.timezone('Etc/GMT+9')
+            aware_time = original_tz.localize(without_tz)
+            converted_time = aware_time.astimezone(pytz.utc)
+            received_time = converted_time.strftime("%Y/%m/%d, %H:%M")
+            # dt_object = datetime.fromisoformat(received_time)
+
+            # offset = message.get('received_time').tzinfo.utcoffset(message.get('received_time'))
+            # print(message.get('received_time'), received_time)
+            # received_time = message.get('received_time').strftime("%Y/%m/%d, %H:%M")
+            if msg_end!=msg_start:
+                if analysis:
+                    imp_score = analysis.get('importance_score', '')
+                    imp_desc = analysis.get('importance_description', '')
+                    score_and_reason = f"{imp_score} : \n {imp_desc}"
+                    worksheet.merge_range('J'+str(msg_start)+':J'+str(msg_end), score_and_reason, cell_format_left)
+                    worksheet.merge_range('K'+str(msg_start)+':K'+str(msg_end), analysis.get('summary'), cell_format_left)
+                    replies = analysis.get('replies', [])
+                    reply_txt = ''
+                    if replies:
+                        reply_txt = f"簡潔 : {replies[0]}\n確認 : {replies[1]}\n丁寧 : {replies[2]}"
+                    worksheet.merge_range('L'+str(msg_start)+':M'+str(msg_end), reply_txt, cell_format_left)
+                    worksheet.merge_range('N'+str(msg_start)+':N'+str(msg_end), analysis.get('category'), cell_format_center)
+                    worksheet.merge_range('I'+str(msg_start)+':I'+str(msg_end), message.get('previous_messages_summary', ''), cell_format_left)
+                worksheet.merge_range('B'+str(msg_start)+':B'+str(msg_end), received_time, cell_format_left)
+                worksheet.merge_range('C'+str(msg_start)+':C'+str(msg_end), message.get('subject'), cell_format_left)
+                worksheet.merge_range('D'+str(msg_start)+':D'+str(msg_end), message.get('sender'), cell_format_left)
+                worksheet.merge_range('E'+str(msg_start)+':F'+str(msg_end), message.get('body'), cell_format_left)
+                
+            else:
+                if analysis:
+                    imp_score = analysis.get('importance_score', '')
+                    imp_desc = analysis.get('importance_description', '')
+                    score_and_reason = f"{imp_score} : \n {imp_desc}"
+                    worksheet.write('J'+str(msg_start), score_and_reason, cell_format_left)
+                    worksheet.write('K'+str(msg_start), analysis.get('summary'), cell_format_left)
+                    replies = analysis.get('replies', [])
+                    reply_txt = ''
+                    if replies:
+                        reply_txt = f"簡潔 : {replies[0]}\n確認 : {replies[1]}\n丁寧 : {replies[2]}"
+                    worksheet.merge_range('L'+str(msg_start)+':M'+str(msg_end), reply_txt, cell_format_left)
+                    worksheet.write('N'+str(msg_start), analysis.get('category'), cell_format_center)
+                    worksheet.write('I'+str(msg_start), message.get('previous_messages_summary', ''), cell_format_left)
+                
+                worksheet.write('B'+str(msg_start), received_time, cell_format_left)
+                worksheet.write('C'+str(msg_start), message.get('subject'), cell_format_left)
+                worksheet.write('D'+str(msg_start), message.get('sender'), cell_format_left)
+                worksheet.merge_range('E'+str(msg_start)+':F'+str(msg_end), message.get('body'), cell_format_left)
+                
+            msg_end+=1
+            msg_start=msg_end
+            end_row = msg_end
+        
+        worksheet.merge_range('A'+str(start_row)+':A'+str(end_row), doc.get('subject'), cell_format_center)
+        end_row+=1
+        start_row = end_row
+        
+    workbook.close()
+    output.seek(0)
+    
+    # Use Flask's send_file to return the buffer as an attachment
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name='data.xlsx'
+    )
