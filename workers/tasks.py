@@ -418,7 +418,7 @@ async def _generate_importance_analysis_async(conv_id, message_id, user_id):
             if len(words) > 100:
                 importance_description = ' '.join(words[:100]) + '...'
 
-            if importance_score > 80 and "helpdesk@ffp.co.jp" in current_message.get('receivers', ''):
+            if importance_score >= 70 and "helpdesk@ffp.co.jp" in current_message.get('receivers', ''):
                 # Prepare the JSON payload for a Teams message
                 # This uses a simple text format
                 received_time = current_message.get('received_time', '')
@@ -556,6 +556,7 @@ async def _generate_summary_and_replies_async(conv_id, message_id, user_id):
         f"   - One 'Concise' reply."
         f"   - One 'Confirm' reply (for confirmation of receipt or understanding)."
         f"   - One 'Polite' reply (using the most polite form of Japanese)."
+        f"   - **You must format the replies to be highly readable. Insert newline character (`\n`) with regards to standard Japanese mail to separate sentences or phrases for clarity.**"
         f"   If no reply is needed (e.g., sender contains 'no-reply' or content is purely informational with no action required), the 'replies' array should be empty and the 'summary' should state '返信不要' (No reply needed)."
         f"3. **Categorize the email**: Assign the email to one of the following categories in Japanese: "
         f"'エラー' (Error), '修理' (Repair), '問い合わせ' (Inquiry), '報告' (Report), 'キャンペーン' (Campaign),'お知らせ' (Notice), 'プロモーション' (Promotion), 'スパム' (Spam), '有害' (Harmful), '返信不要' (No reply needed)."
@@ -572,12 +573,13 @@ async def _generate_summary_and_replies_async(conv_id, message_id, user_id):
     summary = "Could not generate summary."
     replies = []
     category = "Unknown"
-
+    print(gemini_response_json)
     if gemini_response_json:
         try:
             summary = gemini_response_json.get('summary', summary)
             # Replies are an array of objects, extract just the 'text'
             replies = [r.get('text') for r in gemini_response_json.get('replies', []) if r.get('text')]
+            print(replies)
             category = gemini_response_json.get('category', category)
 
         except Exception as e:

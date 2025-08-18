@@ -26,7 +26,11 @@ def get_dashboard_data():
 
     data = request.get_json()
     user_id = data.get('user_id')
-    message_id = data.get('message_id').replace('/', '-') # New: for Outlook messages
+    message_id = data.get('message_id').replace('/', '-').replace('+', '_') # For Outlook messages
+    conv_id = data.get('conv_id').replace('/', '-').replace('+', '_')
+    # print(user_id)
+    # print(message_id)
+    # print(conv_id)
 
     if not user_id:
         return jsonify({"status": "error", "message": "User ID is required"}), 400
@@ -35,7 +39,7 @@ def get_dashboard_data():
     platform = data.get('platform')
     if platform=='gmail':
         creds, history =load_google_credentials(user_id)
-        print(creds)
+        # print(creds)
         if not creds:
             print(f"Token for user {user_id} has expired. Sending 401.")
             return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
@@ -54,27 +58,36 @@ def get_dashboard_data():
         default_prefs = {
             'user_id': user_id,
             'enable_importance': True,
-            'enable_confidential_detection': True
+            'enable_generation': True
         }
         preferences_collection.insert_one(default_prefs)
         user_pref_doc = default_prefs # Use the newly created defaults
     
     preferences = {
         'enable_importance': user_pref_doc.get('enable_importance', False),
-        'enable_confidential_detection': user_pref_doc.get('enable_confidential_detection', False)
+        'enable_generation': user_pref_doc.get('enable_generation', False)
     }
     analysis_result = "Analysis loading..."
     # from database import messages_collection # Import here to avoid circular if already in utils
     print('Message Loading')
-    message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
-    print("Message Loaded")
-    if message_doc and 'analysis' in message_doc:
-        analysis_data = message_doc['analysis']
+    # message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
+
+    current_message_doc = inbox_conversations_collection.find_one(
+        {'conv_id': conv_id, 'messages.message_id': message_id},
+        {'_id': 0, 'messages.$': 1}
+    )
+    # print(current_message_doc)
+    current_message = {}
+    if current_message_doc:
+        current_message = current_message_doc['messages'][0]
+    # print("Message Loaded")
+    if current_message and 'analysis' in current_message:
+        analysis_data = current_message.get('analysis')
         importance_score = analysis_data.get('importance_score')
         importance_description = analysis_data.get('importance_description')
         category = analysis_data.get('category')
         
-        analysis_result = f"Importance: {importance_score or 'N/A'} - {importance_description or 'Loading...'}\nCategory: {category or 'Loading...'}"
+        analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'} \n カテゴリー: {category or 'Loading...'}"
 
     return jsonify({
         "status": "success",
@@ -91,14 +104,14 @@ def save_preferences():
     data = request.get_json()
     user_id = data.get('user_id')
     enable_importance = data.get('enable_importance')
-    enable_confidential_detection = data.get('enable_confidential_detection')
+    enable_generation = data.get('enable_generation')
 
     if not user_id:
         return jsonify({"status": "error", "message": "User ID is required"}), 400
 
     update_data = {
         'enable_importance': enable_importance,
-        'enable_confidential_detection': enable_confidential_detection
+        'enable_generation': enable_generation
     }
 
     preferences_collection.update_one(
@@ -126,19 +139,28 @@ def suggest_reply():
 
     data = request.get_json()
     user_id = data.get('user_id')
-    message_id = data.get('message_id').replace('/', '-') # From Outlook context
+    message_id = data.get('message_id').replace('/', '-').replace('+', '_') # For Outlook messages
+    conv_id = data.get('conv_id').replace('/', '-').replace('+', '_') # From Outlook context
 
 
     if not user_id:
         return jsonify({"status": "error", "message": "User ID is required"}), 400
 
     # print(f"Message id : {message_id} User Id:{user_id}")
-    message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
+    # message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
     # print(message_doc)
+    current_message_doc = inbox_conversations_collection.find_one(
+        {'conv_id': conv_id, 'messages.message_id': message_id},
+        {'_id': 0, 'messages.$': 1}
+    )
+    # print(current_message_doc)
+    current_message = {}
+    if current_message_doc:
+        current_message = current_message_doc['messages'][0]
     
     suggested_replies = []
-    if message_doc and 'analysis' in message_doc:
-        replies_from_db = message_doc['analysis'].get('suggested_replies', [])
+    if current_message and 'analysis' in current_message:
+        replies_from_db = current_message.get('analysis').get('replies', [])
         if replies_from_db:
             suggested_replies = replies_from_db
             # print(f"Fetched replies from DB for {message_id}.")
@@ -197,7 +219,7 @@ def get_emails():
     # Fetch all conversations
     for conv_doc in inbox_conversations_collection.find({}, {'_id': 0}):
         conv_id = conv_doc.get('conv_id')
-        subject = conv_doc.get('subject', '')
+        subject = conv_doc.get('messages')[0].get('subject')
         email_address = conv_doc.get('email_address', '')
         messages_out = []
 
@@ -265,7 +287,7 @@ def trigger_analysis(conv_id, message_id, user_id, analysis_type):
     """
     Triggers a specific analysis task for a given email.
     """
-    print(conv_id[:10], message_id[:10], user_id)
+    # print(conv_id[:10], message_id[:10], user_id)
     # import workers.tasks as tasks
     if analysis_type == 'importance':
         generate_importance_analysis.delay(conv_id, message_id, user_id)
@@ -301,7 +323,7 @@ def get_email_analysis(conv_id, message_id, user_id):
     
     if current_message and 'analysis' in current_message:
         print("Pooling Analysis")
-        print(current_message['analysis'])
+        # print(current_message['analysis'])
         return jsonify({"status": "success", "analysis": current_message['analysis']})
     else:
         return jsonify({"status": "not_found", "message": "Analysis not found or not yet completed."}), 200
@@ -405,7 +427,7 @@ def sync_all_mail():
                             response_data = resp.json()
                             
                             conversations = response_data.get('value', [])
-                            print(len(conversations))
+                            # print(len(conversations))
                             
                             for conv in conversations[8:11]:
                                 conversation_id = conv.get('conversationId')
@@ -567,6 +589,66 @@ def save_draft():
         # Handle any unexpected errors
         print(f"Error in save_draft: {e}")
         return jsonify({'error': 'An internal server error occurred'}), 500
+
+
+@add_on_bp.route('/validate_outgoing', methods=['POST'])
+def validate_outgoing():
+    print("********************Validating Outgoing Mail*********************")
+    try:
+        email_data = request.json
+        if not email_data:
+            return jsonify({"status": "error", "message": "No email data provided"}), 400
+        print(email_data)
+
+        # Run the validation task asynchronously
+        # task = validate_outgoing_email_task.delay(email_data)
+        
+        # In a real-world scenario, you might have a webhook or long-polling mechanism.
+        # For simplicity, we'll wait for the result here (not recommended for production).
+        # A better approach would be to return a task_id and have the frontend poll for the result.
+        
+        # Let's assume you've set up a blocking call for demonstration purposes.
+        # This is a synchronous version for a quick proof of concept.
+        
+        # This part should be non-blocking in a production environment.
+        # The frontend should poll a status endpoint with the task_id.
+        # For this example, we'll simulate the check directly.
+        
+        # --- Synchronous, simplified check for demonstration ---
+        # llm_checker = LLMChecker()
+        # rag_checker = RAGChecker()
+
+        # Perform checks
+        # content_check = rag_checker.check_content(email_data)
+        # pii_check = llm_checker.check_pii(email_data)
+        # recipient_check = llm_checker.check_recipients(email_data)
+
+        # Aggregate results
+        # if pii_check.get("has_fatal_pii"):
+        #     return jsonify({
+        #         "status": "fatal",
+        #         "message": f"Potential PII detected: {pii_check.get('pii_details')}. Sending is blocked."
+        #     }), 200
+        
+        # warnings = []
+        # if content_check.get("is_incomplete"):
+        #     warnings.append("The email may be missing a required disclaimer or attachment.")
+        
+        # if recipient_check.get("is_suspicious"):
+        #     warnings.append(f"The recipient address '{email_data['recipients'][0]}' seems unusual for the content.")
+
+        # if warnings:
+        #     return jsonify({
+        #         "status": "warning",
+        #         "message": " ".join(warnings)
+        #     }), 200
+        
+        # No issues found
+        return jsonify({"status": "success", "message": "Email is ready to send."}), 200
+
+    except Exception as e:
+        print(f"Error processing outgoing email: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred."}), 500
 
 import xlsxwriter
 import io
