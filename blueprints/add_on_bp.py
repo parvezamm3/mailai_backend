@@ -4,16 +4,25 @@ import time
 from bs4 import BeautifulSoup
 from flask import Blueprint, request, jsonify, send_file
 from database import preferences_collection, users_collection, inbox_messages_collection, draft_messages_collection, inbox_conversations_collection
-from utils.outlook_utils import load_outlook_credentials, get_outlook_message_details_graph, send_outlook_reply_graph, get_application_access_token, get_outlook_access_token
+from utils.outlook_utils import (
+    load_outlook_credentials, send_outlook_reply_graph, 
+    get_application_access_token, get_outlook_access_token,
+    prepare_conversation_thread, process_outlook_mail,
+    get_base_endpoint, get_url_headers
+)
 from utils.transform_utils import decode_conversation_index, convert_utc_to_local
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
 from utils.gmail_utils import load_google_credentials
-from workers.tasks import generate_attachment_summary, generate_previous_emails_summary, generate_importance_analysis, generate_summary_and_replies
+from utils.gemini_utils import call_gemini_api_structured_output
+from workers.tasks import (
+    generate_attachment_summary, generate_previous_emails_summary, generate_importance_analysis, 
+    generate_summary_and_replies)
 from config import Config
 from pprint import pprint
 
 
 add_on_bp = Blueprint('add_on_bp', __name__)
+
 
 @add_on_bp.route('/dashboard_data', methods=['POST'])
 def get_dashboard_data():
@@ -26,35 +35,38 @@ def get_dashboard_data():
 
     data = request.get_json()
     user_id = data.get('user_id')
+    owner_email = data.get('ownerEmail')
+    sender = data.get('sender')
     message_id = data.get('message_id').replace('/', '-').replace('+', '_') # For Outlook messages
     conv_id = data.get('conv_id').replace('/', '-').replace('+', '_')
-    # print(user_id)
-    # print(message_id)
-    # print(conv_id)
 
     if not user_id:
-        return jsonify({"status": "error", "message": "User ID is required"}), 400
-    
-    print(f"Received request for user: {user_id} and Message: {message_id}")
-    platform = data.get('platform')
-    if platform=='gmail':
-        creds, history =load_google_credentials(user_id)
-        # print(creds)
-        if not creds:
-            print(f"Token for user {user_id} has expired. Sending 401.")
-            return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
+        print("No User id")
+        return jsonify({"status": "error", "message": "ユーザーIDが必要です。"}), 401
+    user_data = users_collection.find_one({'user_id': user_id})
+    if not user_data:
+        print("No User Dtata")
+        return jsonify({"status": "error", "message": "このメールアドレス {user_id} を持つユーザーは存在しません。まず承認してください。"}), 401
+    # print(f"Received request for user: {user_id} and Message: {message_id}")
+    # platform = data.get('platform')
+    # if platform=='gmail':
+    #     creds, history =load_google_credentials(user_id)
+    #     # print(creds)
+    #     if not creds:
+    #         print(f"Token for user {user_id} has expired. Sending 401.")
+    #         return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
         
-    if platform=='outlook':
-        creds = load_outlook_credentials(user_id)
-        if not creds:
-            print(f"Token for user {user_id} has expired. Sending 401.")
-            return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
+    # if platform=='outlook':
+    #     creds = load_outlook_credentials(user_id, user_data)
+    #     if not creds:
+    #         print(f"Token for user {user_id} has expired. Sending 401.")
+    #         return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
 
-    print(f"Credentials for user {user_id} are valid.")
+    # print(f"Credentials for user {user_id} are valid.")
     # --- 1. Get or Create User Preferences from MongoDB ---
     user_pref_doc = preferences_collection.find_one({'user_id': user_id})
     if not user_pref_doc:
-        print(f"Creating new preferences for user: {user_id} in MongoDB")
+        # print(f"Creating new preferences for user: {user_id} in MongoDB")
         default_prefs = {
             'user_id': user_id,
             'enable_importance': True,
@@ -67,33 +79,95 @@ def get_dashboard_data():
         'enable_importance': user_pref_doc.get('enable_importance', False),
         'enable_generation': user_pref_doc.get('enable_generation', False)
     }
+    is_spam = False
+    is_malicious = False
     analysis_result = "Analysis loading..."
-    # from database import messages_collection # Import here to avoid circular if already in utils
-    print('Message Loading')
-    # message_doc = inbox_messages_collection.find_one({'message_id': message_id, 'email_address': user_id})
-
     current_message_doc = inbox_conversations_collection.find_one(
         {'conv_id': conv_id, 'messages.message_id': message_id},
         {'_id': 0, 'messages.$': 1}
     )
     # print(current_message_doc)
     current_message = {}
+    analysis_data = {}
     if current_message_doc:
         current_message = current_message_doc['messages'][0]
+        analysis_data = current_message.get('analysis', {})
     # print("Message Loaded")
-    if current_message and 'analysis' in current_message:
-        analysis_data = current_message.get('analysis')
-        importance_score = analysis_data.get('importance_score')
-        importance_description = analysis_data.get('importance_description')
-        category = analysis_data.get('category')
+    generating_analsysis = False
+    
+    count = 0
+    # print("Category :", analysis_data.get('category'))
+    # print(analysis_data and not analysis_data.get('category'))
+    while not analysis_data or not analysis_data.get('category'):
+        if not generating_analsysis:
+            prepare_conversation_thread(owner_email, conv_id, message_id)
+            generating_analsysis = True      
         
-        analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'} \n カテゴリー: {category or 'Loading...'}"
+        current_message_doc = inbox_conversations_collection.find_one(
+            {'conv_id': conv_id, 'messages.message_id': message_id},
+            {'_id': 0, 'messages.$': 1}
+        )
+        if current_message_doc:
+            # print(len(current_message_doc['messages']))
+            current_message = current_message_doc['messages'][0]
+            analysis_data = current_message.get('analysis', {})
+        else:
+            conv_id, message_id = process_outlook_mail(message_id, owner_email)
+        if sender==owner_email:
+            return jsonify({"status": "error", "message": "ユーザーはメールの送信者です。分析は処理されません。"}), 400
+        count+=1
+        # print(analysis_data)
+        # print(count)
+        if count>25:
+            break
+        time.sleep(1)
+        
+    if analysis_data:
+        is_spam = analysis_data.get('is_spam', False)
+        is_malicious = analysis_data.get('is_malicious', False)
+        importance_score = analysis_data.get('importance_score', '')
+        importance_description = analysis_data.get('importance_description', "")
+        category = analysis_data.get('category', '')
+        summary = analysis_data.get('summary', '')
+        replies = analysis_data.get('replies', [])
+        # print(replies, category)
+        
+        analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'}"
 
-    return jsonify({
-        "status": "success",
-        "analysis_result": analysis_result,
-        "preferences": preferences,
-    })
+        return jsonify({
+            "status": "success",
+            "is_spam":is_spam,
+            "is_malicious":is_malicious,
+            "analysis_result": analysis_result,
+            "preferences": preferences,
+            'summary':summary,
+            'category':category,
+            'replies':replies
+        })
+    return jsonify({"status": "error", "message": "問題が発生したか、処理に時間がかかっています。結果を表示するには画面をリフレッシュしてください。"}), 400
+
+
+# @add_on_bp.route('/generate_analysis_outlook', methods=['POST'])
+# def generate_analysis_outlook():
+#     if not request.is_json:
+#         return jsonify({"status": "error", "message": "Request must be JSON"}), 400
+
+#     data = request.get_json()
+#     owner_email = data.get('ownerEmail')
+#     message_id = data.get('message_id').replace('/', '-').replace('+', '_') # For Outlook messages
+#     result = process_outlook_mail(message_id, owner_email)
+#     analysis_data = result.get('messages')[0]
+#     is_spam = analysis_data.get('is_spam', False)
+#     is_malicious = analysis_data.get('is_malicious', False)
+#     importance_score = analysis_data.get('importance_score', '')
+#     importance_description = analysis_data.get('importance_description', "")
+#     analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'}"
+#     return jsonify({
+#         "status": "success",
+#         "is_spam":is_spam,
+#         "is_malicious":is_malicious,
+#         "analysis_result": analysis_result
+#     })
 
 @add_on_bp.route('/save_preferences', methods=['POST'])
 def save_preferences():
@@ -157,33 +231,31 @@ def suggest_reply():
     current_message = {}
     if current_message_doc:
         current_message = current_message_doc['messages'][0]
-    
+    category = ''
     suggested_replies = []
     if current_message and 'analysis' in current_message:
         replies_from_db = current_message.get('analysis').get('replies', [])
         if replies_from_db:
             suggested_replies = replies_from_db
+            category = current_message.get('analysis').get('category')
             # print(f"Fetched replies from DB for {message_id}.")
         else:
-            print(f"Replies not yet generated for {message_id}. Attempting fallback dummy replies.")
+            # print(f"Replies not yet generated for {message_id}. Attempting fallback dummy replies.")
             # Fallback if replies aren't in DB yet (tasks still running)
             suggested_replies = [
-                f"Thank you for your email.",
-                f"I'll get back to you shortly.",
-                f"Acknowledged."
+                f"データベースに生成された返信候補がありません",
             ]
     else:
-        print(f"Message {message_id} not found in DB or analysis missing. Generating dummy replies.")
+        # print(f"Message {message_id} not found in DB or analysis missing. Generating dummy replies.")
         # Fallback if message not found or no analysis field
         suggested_replies = [
-            f"Thank you for your email.",
-            f"I'll get back to you shortly.",
-            f"Acknowledged."
+            f"このメールの分析データはデータベースに存在しません"
         ]
     
     return jsonify({
         "status": "success",
-        "suggested_replies": suggested_replies
+        "suggested_replies": suggested_replies,
+        "category":category
     })
 
 @add_on_bp.route('/send_outlook_reply', methods=['POST'])
@@ -309,11 +381,6 @@ def get_email_analysis(conv_id, message_id, user_id):
     Fetches the latest analysis results for a specific email.
     """
     print("Get Email Analysis")
-    # email_doc = inbox_messages_collection.find_one(
-    #     {'message_id': message_id, 'email_address': user_id},
-    #     {'_id': 0, 'analysis': 1} # Only return the analysis field
-    # )
-    # print(email_doc)
 
     current_message_doc = inbox_conversations_collection.find_one(
         {'conv_id': conv_id, "email_address":user_id, 'messages.message_id': message_id},
@@ -391,7 +458,7 @@ def sync_all_mail():
             mail_folders_endpoint = ''
             
             if account_type=="licensed":
-                access_token = get_outlook_access_token(email_address)
+                access_token = get_outlook_access_token(email_address, account_type, user_data)
                 # api_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/me/mailfolders('inbox')/messages?$orderby=receivedDateTime desc"
                 mail_folders_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/me/mailFolders"
             elif account_type=="unlicensed":
@@ -418,7 +485,7 @@ def sync_all_mail():
                     folder_id = folder.get('id')
                     folder_display_name = folder.get('displayName')
                     if folder_display_name=="緊急度高":
-                        messages_endpoint = f"{mail_folders_endpoint}/'{folder_id}'/messages?$select=conversationId,subject&$orderby=receivedDateTime desc"
+                        messages_endpoint = f"{mail_folders_endpoint}/'{folder_id}'/messages?$select=conversationId,id&$orderby=receivedDateTime desc"
                         next_link = messages_endpoint
                         
                         while next_link:
@@ -429,105 +496,14 @@ def sync_all_mail():
                             conversations = response_data.get('value', [])
                             # print(len(conversations))
                             
-                            for conv in conversations[8:11]:
+                            for conv in conversations[1:3]:
                                 conversation_id = conv.get('conversationId')
+                                message_id=conv.get('id')
                                 # subject = conv.get('subject', 'N/A')
                                 # print("------------Conversation-------------------")
                                 # print(conversation_id, subject)
-                                inbox_conversations_collection.update_one
-                                conversation_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages?$filter=conversationId eq '{conversation_id}'"
-                                conv_resp = requests.get(conversation_endpoint, headers=headers)
-                                conv_resp.raise_for_status()
-                                conv_response_data = conv_resp.json()
-                                
-                                conv_messages = conv_response_data.get('value', [])
-                                messages = []
-                                # count = 0
-                                for msg in conv_messages:
-                                    # print(msg)
-                                    # print('-----------------Message---------------')
-                                    message_id = msg.get('id')
-                                    msg_subject = msg.get('subject')
-                                    # print(message_id, msg_subject)
-                                    msg_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages/{message_id}?$select=uniqueBody"
-                                    single_msg_resp = requests.get(msg_endpoint, headers=headers)
-                                    single_msg_resp.raise_for_status()
-                                    single_msg_data = single_msg_resp.json()
-                                    # print(single_msg_data.get("uniqueBody", {}))
-
-                                    conv_index = msg.get('conversationIndex')
-                                    number_of_child_replies = decode_conversation_index(msg.get('conversationIndex')).get("number of replies", '')
-                                    sender_info = msg.get('sender', {}).get('emailAddress', {})
-                                    sender = sender_info.get('address', 'N/A')
-                                    receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
-                                    receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
-                                    cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('ccRecipients', [])]
-                                    bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('bccRecipients', [])]
-                                    # body_content = msg.get('body')
-                                    body_content = single_msg_data.get("uniqueBody", {})
-                                    cleaned_body = get_unique_body_outlook(body_content)
-                                    inline_attachments = get_inline_attachments_outlook(body_content)
-                                    attachments_data = []
-                                    # print(msg.get('hasAttachments'))
-                                    if msg.get('hasAttachments') or len(inline_attachments)>0:
-                                        # print(f"Message {message_id[:10]} has attachments. Fetching attachment details...")
-                                        attachments_url = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages/{message_id}/attachments"
-                                        try:
-                                            attachments_resp = requests.get(attachments_url, headers=headers)
-                                            attachments_resp.raise_for_status()
-                                            fetched_attachments = attachments_resp.json().get('value', [])
-                                            
-                                            for attach in fetched_attachments:
-                                                # Only store relevant fields and contentBytes if available
-                                                attachment_info = {
-                                                    'id': attach.get('id'),
-                                                    'name': attach.get('name'),
-                                                    'contentType': attach.get('contentType'),
-                                                    'size': attach.get('size'),
-                                                    'isInline': attach.get('isInline', False),
-                                                    'contentBytes': attach.get('contentBytes') 
-                                                }
-                                                attachments_data.append(attachment_info)
-                                            # print(f"  Fetched {len(attachments_data)} attachment details for message {message_id}.")
-                                        except requests.exceptions.RequestException as attach_e:
-                                            print(f"  Error fetching attachments for message {message_id}: {attach_e}")
-                                            if attach_e.response:
-                                                print(f"  Attachment fetch error response: {attach_e.response.text}")
-                                    received_time = convert_utc_to_local(msg.get('receivedDateTime', {}))
-                                    
-                                    message_doc = {
-                                        'message_id': message_id,
-                                        'subject':msg_subject,
-                                        'conv_index':conv_index,
-                                        "child_replies":number_of_child_replies,
-                                        'sender': sender,
-                                        'receivers': receivers_list,
-                                        'cc': cc_list,
-                                        'bcc': bcc_list,
-                                        'body': cleaned_body,
-                                        'full_message_payload': conv,
-                                        'webLink': conv.get('webLink'),
-                                        'received_time':received_time,
-                                        'attachments':attachments_data,
-                                        'type':'outlook_received_mail'
-                                    }
-                                    messages.append(message_doc)
-                                conv_doc = {
-                                    'conv_id': conversation_id, 
-                                    'email_address': email_address, 
-                                    'messages':messages
-                                }
-                                inbox_conversations_collection.update_one(
-                                    {'conv_id': conversation_id},
-                                    {'$set': conv_doc},
-                                    upsert=True
-                                )
-                                for message in messages:
-                                    if 'ffp.co.jp' not in message.get('sender'):
-                                        attachments = message.get('attachments')
-                                        if len(attachments)>0:
-                                            generate_attachment_summary.delay(conversation_id, message.get('message_id'), email_address, 'outlook')
-                                        generate_previous_emails_summary.delay(conversation_id, message.get('message_id'), email_address)
+                                # inbox_conversations_collection.update_one
+                                prepare_conversation_thread(email_address, conversation_id, message_id)
                             all_messages.extend(conversations)
                             
                             # Check for the next page link
@@ -544,6 +520,101 @@ def sync_all_mail():
     except Exception as e:
         print(f"Error during full mail sync request: {e}")
         return jsonify({"status": "error", "message": f"Internal server error: {e}"}), 500
+
+# def prepare_conversation_thread(email_address, headers, conv, conversation_id):
+#     conversation_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages?$filter=conversationId eq '{conversation_id}'"
+#     conv_resp = requests.get(conversation_endpoint, headers=headers)
+#     conv_resp.raise_for_status()
+#     conv_response_data = conv_resp.json()
+                                
+#     conv_messages = conv_response_data.get('value', [])
+#     messages = []
+#                                 # count = 0
+#     for msg in conv_messages:
+#                                     # print(msg)
+#                                     # print('-----------------Message---------------')
+#         message_id = msg.get('id')
+#         msg_subject = msg.get('subject')
+#                                     # print(message_id, msg_subject)
+#         msg_endpoint = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages/{message_id}?$select=uniqueBody"
+#         single_msg_resp = requests.get(msg_endpoint, headers=headers)
+#         single_msg_resp.raise_for_status()
+#         single_msg_data = single_msg_resp.json()
+#                                     # print(single_msg_data.get("uniqueBody", {}))
+
+#         conv_index = msg.get('conversationIndex')
+#         number_of_child_replies = decode_conversation_index(msg.get('conversationIndex')).get("number of replies", '')
+#         sender_info = msg.get('sender', {}).get('emailAddress', {})
+#         sender = sender_info.get('address', 'N/A')
+#         receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
+#         receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
+#         cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('ccRecipients', [])]
+#         bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('bccRecipients', [])]
+#                                     # body_content = msg.get('body')
+#         body_content = single_msg_data.get("uniqueBody", {})
+#         cleaned_body = get_unique_body_outlook(body_content)
+#         inline_attachments = get_inline_attachments_outlook(body_content)
+#         attachments_data = []
+#                                     # print(msg.get('hasAttachments'))
+#         if msg.get('hasAttachments') or len(inline_attachments)>0:
+#                                         # print(f"Message {message_id[:10]} has attachments. Fetching attachment details...")
+#             attachments_url = f"{Config.MS_GRAPH_ENDPOINT}/users/{email_address}/messages/{message_id}/attachments"
+#             try:
+#                 attachments_resp = requests.get(attachments_url, headers=headers)
+#                 attachments_resp.raise_for_status()
+#                 fetched_attachments = attachments_resp.json().get('value', [])
+                                            
+#                 for attach in fetched_attachments:
+#                                                 # Only store relevant fields and contentBytes if available
+#                     attachment_info = {
+#                                                     'id': attach.get('id'),
+#                                                     'name': attach.get('name'),
+#                                                     'contentType': attach.get('contentType'),
+#                                                     'size': attach.get('size'),
+#                                                     'isInline': attach.get('isInline', False),
+#                                                     'contentBytes': attach.get('contentBytes') 
+#                                                 }
+#                     attachments_data.append(attachment_info)
+#                                             # print(f"  Fetched {len(attachments_data)} attachment details for message {message_id}.")
+#             except requests.exceptions.RequestException as attach_e:
+#                 print(f"  Error fetching attachments for message {message_id}: {attach_e}")
+#                 if attach_e.response:
+#                     print(f"  Attachment fetch error response: {attach_e.response.text}")
+#         received_time = convert_utc_to_local(msg.get('receivedDateTime', {}))
+                                    
+#         message_doc = {
+#                                         'message_id': message_id,
+#                                         'subject':msg_subject,
+#                                         'conv_index':conv_index,
+#                                         "child_replies":number_of_child_replies,
+#                                         'sender': sender,
+#                                         'receivers': receivers_list,
+#                                         'cc': cc_list,
+#                                         'bcc': bcc_list,
+#                                         'body': cleaned_body,
+#                                         'full_message_payload': conv,
+#                                         'webLink': conv.get('webLink'),
+#                                         'received_time':received_time,
+#                                         'attachments':attachments_data,
+#                                         'type':'outlook_received_mail'
+#                                     }
+#         messages.append(message_doc)
+#     conv_doc = {
+#                                     'conv_id': conversation_id, 
+#                                     'email_address': email_address, 
+#                                     'messages':messages
+#                                 }
+#     inbox_conversations_collection.update_one(
+#                                     {'conv_id': conversation_id},
+#                                     {'$set': conv_doc},
+#                                     upsert=True
+#                                 )
+#     for message in messages:
+#         if 'ffp.co.jp' not in message.get('sender'):
+#             attachments = message.get('attachments')
+#             if len(attachments)>0:
+#                 generate_attachment_summary.delay(conversation_id, message.get('message_id'), email_address, 'outlook')
+#             generate_previous_emails_summary.delay(conversation_id, message.get('message_id'), email_address)
 
 @add_on_bp.route('/process_draft', methods=['POST'])
 def save_draft():
@@ -591,60 +662,164 @@ def save_draft():
         return jsonify({'error': 'An internal server error occurred'}), 500
 
 
+def get_latest_message_with_aggregation(conversation_id, email_address):
+    conv_id = conversation_id.replace('/', '-').replace('+', '_')
+    pipeline = [
+        # Match the document with the specific conversation ID
+        {'$match': {'conv_id': conv_id, 'email_address':email_address}},
+        # Unwind the messages array to treat each message as a separate document
+        {'$unwind': '$messages'},
+        # Sort the messages by received_time in descending order
+        {'$sort': {'messages.received_time': -1}},
+        # Group back and take the first (latest) message
+        {'$limit': 1},
+        # You can add a $project stage to shape the output if needed
+        {'$project': {'_id': 0, 'latest_message': '$messages'}}
+    ]
+    # print(conv_id, email_address)
+    result = list(inbox_conversations_collection.aggregate(pipeline))
+    # print(result)
+    if result:
+        return result[0]['latest_message']
+    
+    return {}
+
+
+GEMINI_RESPONSE_SCHEMA = {
+                        "type": "OBJECT",
+                        "properties": {
+                            "sensitive_data": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "has_sensitive_data": { "type": "boolean" },
+                                "comment": { "type": "string" }
+                            },
+                            "required": ["has_sensitive_data", "comment"]
+                            },
+                            "attachments": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "has_missing_attachments": { "type": "boolean" },
+                                "comment": { "type": "string" }
+                            },
+                            "required": ["has_missing_attachments", "comment"]
+                            },
+                            "grammatical_errors": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "has_errors": { "type": "boolean" },
+                                "comment": { "type": "string" }
+                            },
+                            "required": ["has_errors", "comment"]
+                            },
+                            "best_practices": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "is_not_followed": { "type": "boolean" },
+                                "comment": { "type": "string" }
+                            },
+                            "required": ["is_not_followed", "comment"]
+                            },
+                            "spelling_mistakes": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "has_mistakes": { "type": "boolean" },
+                                "comment": { "type": "string" }
+                            },
+                            "required": ["has_mistakes", "comment"]
+                            }
+                        },
+                        "required": ["sensitive_data", "attachments", "grammatical_errors", "best_practices", "spelling_mistakes"]
+                        }
+
 @add_on_bp.route('/validate_outgoing', methods=['POST'])
 def validate_outgoing():
-    print("********************Validating Outgoing Mail*********************")
+    # print("********************Validating Outgoing Mail*********************")
     try:
         email_data = request.json
         if not email_data:
             return jsonify({"status": "error", "message": "No email data provided"}), 400
-        print(email_data)
+        # message_id = email_data.get('message_id').replace('/', '-').replace('+', '_')
+        conv_id = email_data.get('conv_id').replace('/', '-').replace('+', '_')
+        
+        sender = email_data.get('sender')
+        subject = email_data.get('subject')
+        body = email_data.get('body').split('From:')[0]
+        # print(body)
+        # user_data = users_collection.find_one({'user_id': sender})
+        # # print(user_data)
+        # if not user_data:
+        #     print(f'No user with email {sender} exist is the database.')
+        # account_type = user_data.get('account_type')
+        # BASE_ENDPOINT = get_base_endpoint(sender, account_type)
+        # headers = get_url_headers(sender, account_type, user_data)
+        # msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
+        # single_msg_resp = requests.get(msg_endpoint, headers=headers)
+        # single_msg_resp.raise_for_status()
+        # single_msg_data = single_msg_resp.json()
+        # body_content = single_msg_data.get("uniqueBody", {})
+        # print(body_content)
+        # cleaned_body = get_unique_body_outlook(body_content)
+        # print(cleaned_body)
+        receipients = email_data.get('recipients')
+        cc = email_data.get('cc')
+        bcc = email_data.get('bcc')
+        
+        attachments = email_data.get('attachments')
+        email_address = email_data.get('email_address')
+        previous_emails_summary = ''
+        previous_email_sender = ''
+        previous_email_cc = []
+        previous_email_bcc = []
+        previous_email_receipients = []
+        # print(email_data['sender'])
+        if conv_id:
+            latest_message = get_latest_message_with_aggregation(conv_id, email_address)
+            latest_message_id = latest_message.get('message_id')
+            if latest_message_id:
+                previous_emails_summary = latest_message.get('previous_messages_summary', '')
+                previous_email_sender = latest_message.get('sender', '')
+                previous_email_receipients = latest_message.get('receivers', [])
+                previous_email_cc = latest_message.get('cc', [])
+                previous_email_bcc = latest_message.get('bcc', [])
+        prompt = (
+            f"Analyze the following email and return a JSON object based on the schema. "
+            f"The analysis should cover four key areas: sensitive data, missing attachments, grammatical/spelling issues, and general business etiquette.\n\n"
+            f"Provide a True/False result for each condition. If an issue is found (e.g., True), provide a clear and concise description of the error in Japanese within 200 characters. If no issue is found (e.g., False), provide a brief explanatory comment in Japanese.\n\n"
+            f"**Instructions:**\n"
+            f"- **Sensitive Data:** Check the email body and subject for any Personally Identifiable Information (PII) or other sensitive content. **Exclude the email signature from this check, as it is considered personal information that is always present and acceptable.**\n"
+            f"- **Missing Attachments:** Based on the body content (e.g., phrases like 'see attached file'), determine if an attachment is mentioned but not present in the provided list. Assume the provided 'attachments' list contains the names of all files.\n"
+            f"- **Grammar & Spelling:** Identify all grammatical and spelling errors. Be sure to check recipient names against previous email data for consistency.\n"
+            f"- **Japanese Business Etiquette:** Evaluate if the email follows standard Japanese business etiquette, including appropriate use of honorifics (e.g., `様` and `さん`), formal language (`keigo`), and a respectful tone. \n\n"
+            f"**Email Data:**\n"
+            f"Subject: {subject}\n"
+            f"Body:\n{body}\n"
+            f"Attachments: {str(attachments)}\n"
+            f"Sender: {sender}\n"
+            f"Recipients: {', '.join(receipients) if isinstance(receipients, list) else receipients}\n"
+            f"CC: {', '.join(cc) if isinstance(cc, list) else cc}\n"
+            f"BCC: {', '.join(bcc) if isinstance(bcc, list) else bcc}\n\n"
+            f"**Previous Email Data (if available):**\n"
+            f"Previous Conversation Summary: {previous_emails_summary}\n"
+            f"Previous Email Sender: {previous_email_sender}\n"
+            f"Previous Email Recipients: {', '.join(previous_email_receipients)}\n"
+            f"Previous Email CC: {', '.join(previous_email_cc)}\n"
+            f"Previous Email BCC: {', '.join(previous_email_bcc)}\n\n"
+            f"**Output Format (JSON)**:\n"
+            f"{json.dumps(GEMINI_RESPONSE_SCHEMA, indent=2)}\n"
+        )
+        response = call_gemini_api_structured_output(prompt, GEMINI_RESPONSE_SCHEMA)
+        # print("Body :", body)
+        # print(response)
+        # response = {}
 
-        # Run the validation task asynchronously
-        # task = validate_outgoing_email_task.delay(email_data)
-        
-        # In a real-world scenario, you might have a webhook or long-polling mechanism.
-        # For simplicity, we'll wait for the result here (not recommended for production).
-        # A better approach would be to return a task_id and have the frontend poll for the result.
-        
-        # Let's assume you've set up a blocking call for demonstration purposes.
-        # This is a synchronous version for a quick proof of concept.
-        
-        # This part should be non-blocking in a production environment.
-        # The frontend should poll a status endpoint with the task_id.
-        # For this example, we'll simulate the check directly.
-        
-        # --- Synchronous, simplified check for demonstration ---
-        # llm_checker = LLMChecker()
-        # rag_checker = RAGChecker()
-
-        # Perform checks
-        # content_check = rag_checker.check_content(email_data)
-        # pii_check = llm_checker.check_pii(email_data)
-        # recipient_check = llm_checker.check_recipients(email_data)
-
-        # Aggregate results
-        # if pii_check.get("has_fatal_pii"):
-        #     return jsonify({
-        #         "status": "fatal",
-        #         "message": f"Potential PII detected: {pii_check.get('pii_details')}. Sending is blocked."
-        #     }), 200
-        
-        # warnings = []
-        # if content_check.get("is_incomplete"):
-        #     warnings.append("The email may be missing a required disclaimer or attachment.")
-        
-        # if recipient_check.get("is_suspicious"):
-        #     warnings.append(f"The recipient address '{email_data['recipients'][0]}' seems unusual for the content.")
-
-        # if warnings:
-        #     return jsonify({
-        #         "status": "warning",
-        #         "message": " ".join(warnings)
-        #     }), 200
-        
-        # No issues found
-        return jsonify({"status": "success", "message": "Email is ready to send."}), 200
+        # data = {
+        #     'attachments': {'comment': '本文中で添付ファイルについて言及されておらず、添付ファイルもありません。', 'has_missing_attachments': False}, 
+        #     'best_practices': {'comment': '宛名、挨拶、結びの言葉がなく、ビジネスメールとしての形式や敬語が使用されていません。非常に簡潔すぎる内容です。', 'is_not_followed': True}, 
+        #     'grammatical_errors': {'comment': '文法的な誤りはありません。', 'has_errors': True}, 
+        #     'sensitive_data': {'comment': '個人情報や機密情報は含まれていません。', 'has_sensitive_data': True}, 
+        #     'spelling_mistakes': {'comment': 'スペルミスはありません。', 'has_mistakes': False}}
+        return jsonify({"status": "success", "message": "Email is ready to send.", "data":json.dumps(response)}), 200
 
     except Exception as e:
         print(f"Error processing outgoing email: {e}")

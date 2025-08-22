@@ -8,13 +8,14 @@ from urllib.parse import urlparse, urlunparse
 from flask import session
 # from msal import ConfidentialClientApplication # pip install msal
 from config import Config
-from database import users_collection, inbox_messages_collection, inbox_conversations_collection # Assuming database.py provides this
+from database import users_collection, inbox_conversations_collection # Assuming database.py provides this
 
 from utils.transform_utils import decode_conversation_index, convert_utc_to_local
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
-
-
-# https://fujifp.webhook.office.com/webhookb2/913cd079-55ac-4bbf-89d7-010c915152f0@4148b7ec-5c94-49f0-b57d-af6b7db7a0e9/IncomingWebhook/70468024b559404590c12691013a1c1d/99e943eb-614f-4f97-8b2f-7070b762237e/V27AfS48Mc1nlsmIqpDk2Nq8Wpf7Gs9ycjJSjU07DWdDE1
+from workers.tasks import (
+    generate_attachment_summary, generate_previous_emails_summary, 
+    generate_importance_analysis, generate_summary_and_replies
+)
 
 celery_app = None
 msal_app = None
@@ -42,15 +43,11 @@ def get_application_access_token():
         'client_secret': Config.MS_GRAPH_CLIENT_SECRET,
         'grant_type': 'client_credentials'
     }
-    # print(payload)
 
     try:
         response = requests.post(token_url, data=payload)
-        # print(response.content)
         response.raise_for_status()
         token_data = response.json()
-        # print(token_data)
-        
         expires_in = token_data.get('expires_in', 3600)
         _app_token_cache['access_token'] = token_data.get('access_token')
         _app_token_cache['expires_at'] = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
@@ -79,10 +76,10 @@ def save_outlook_credentials(user_id, token_response, expires_in):
     )
     print(f"Outlook credentials saved for user: {user_id}")
 
-def load_outlook_credentials(user_id):
+def load_outlook_credentials(user_id, user_data):
     """Loads and refreshes user's Microsoft Graph API tokens from MongoDB."""
     print("Load Outlook Credentials")
-    user_data = users_collection.find_one({'user_id': user_id})
+    # user_data = users_collection.find_one({'user_id': user_id})
     if user_data and 'credentials' in user_data:
         token_info = user_data['credentials']
         expires_at_utc = token_info.get('expires_at')
@@ -116,23 +113,34 @@ def load_outlook_credentials(user_id):
     return None
 
 # --- Unified access token retrieval ---
-def get_outlook_access_token(user_id):
+def get_outlook_access_token(user_id, account_type, user_data):
     """
     Retrieves the correct access token based on the account type.
     """
-    user_data = users_collection.find_one({'user_id': user_id})
-    if not user_data:
-        print(f"User {user_id} not found.")
-        return None
-
-    account_type = user_data.get('account_type')
     if account_type == 'licensed':
-        return load_outlook_credentials(user_id)
+        return load_outlook_credentials(user_id, user_data)
     elif account_type == 'unlicensed':
         return get_application_access_token()
     else:
         print(f"Unknown account type for {user_id}.")
         return None
+    
+def get_base_endpoint(user_id, account_type):
+    BASE_ENDPOINT=""
+    if account_type == 'licensed':
+        BASE_ENDPOINT = f"{Config.MS_GRAPH_ENDPOINT}/me"
+    elif account_type == 'unlicensed':
+        BASE_ENDPOINT = f"{Config.MS_GRAPH_ENDPOINT}/users/{user_id}"
+    return BASE_ENDPOINT
+
+def get_url_headers(user_id, account_type, user_data):
+    access_token = get_outlook_access_token(user_id, account_type, user_data)
+    if not access_token:
+        print(f"Could not load access token for {user_id}.")
+        return None
+
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+    return headers
 
 def get_outlook_message_details_graph(access_token, message_id):
     """Fetches full message details (subject, body, sender) using Microsoft Graph API."""
@@ -210,20 +218,9 @@ def subscribe_to_outlook_mail_webhook(user_id):
     Creates a Microsoft Graph API webhook subscription for new mail.
     Dynamically uses the correct access token and resource URL.
     """
-    # print(user_id)
-    access_token = get_outlook_access_token(user_id)
-    # print(access_token)
-    if not access_token:
-        print(f"Failed to get access token for webhook subscription for {user_id}.")
-        return False
-    
     user_data = users_collection.find_one({'user_id': user_id})
     account_type = user_data.get('account_type')
-
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
+    headers = get_url_headers(user_id, account_type, user_data)
 
     # Determine the resource URL based on account type
     if account_type == 'licensed':
@@ -274,6 +271,23 @@ def extract_email_thread(text, delim1, delim2):
         return [text]
 # --- Unified webhook notification processing ---
 
+def process_outlook_mail(message_id, owner_mail):
+    user_data = users_collection.find_one({'user_id': owner_mail})
+    # print(user_data)
+    if not user_data:
+        print(f'No user with email {owner_mail} exist is the database.')
+    account_type = user_data.get('account_type')
+    BASE_ENDPOINT = get_base_endpoint(owner_mail, account_type)
+    headers = get_url_headers(owner_mail, account_type, user_data)
+    msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}"
+    msg_resp = requests.get(msg_endpoint, headers=headers)
+    msg_resp.raise_for_status()
+    msg_data = msg_resp.json()
+
+    conv_id = msg_data.get('conversationId')
+    new_conv_id, new_msg_id = process_single_mail(BASE_ENDPOINT, owner_mail, conv_id, headers, msg_data, msg_data.get('id'))
+    return new_conv_id, new_msg_id
+
 CURRENT_MESSAGE_ID = ""
 def process_outlook_webhook_notification_unified(notification_data):
     """
@@ -282,25 +296,24 @@ def process_outlook_webhook_notification_unified(notification_data):
     resource = notification_data.get('resource')
     change_type = notification_data.get('changeType')
     user_id = notification_data.get('clientState')
+    if user_id=="yokoyama_yu@ffp.co.jp":
+        return True
     global CURRENT_MESSAGE_ID
     # print(f"Received change type: {change_type} for user: {user_id}")
     if resource and 'messages' in resource.lower() and change_type == 'created':
         print(f"Processing new message notification for user: {user_id}")
-        access_token = get_outlook_access_token(user_id)
-        if not access_token:
-            print(f"Could not load access token for {user_id}.")
-            return False
+        # access_token = get_outlook_access_token(user_id)
+        # if not access_token:
+        #     print(f"Could not load access token for {user_id}.")
+        #     return False
 
-        headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+        # headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+        user_data = users_collection.find_one({'user_id': user_id})
+        account_type = user_data.get('account_type')
+        headers = get_url_headers(user_id, account_type, user_data)
         
         # Determine the API endpoint based on the account type
-        user_data = users_collection.find_one({'user_id': user_id})
-        account_type = user_data.get('account_type') if user_data else None
-        BASE_ENDPOINT=""
-        if account_type == 'licensed':
-            BASE_ENDPOINT = f"{Config.MS_GRAPH_ENDPOINT}/me"
-        elif account_type == 'unlicensed':
-            BASE_ENDPOINT = f"{Config.MS_GRAPH_ENDPOINT}/users/{user_id}"
+        BASE_ENDPOINT = get_base_endpoint(user_id, account_type)
 
 
         api_endpoint = f"{BASE_ENDPOINT}/mailfolders('inbox')/messages?$top=1&$orderby=receivedDateTime desc"
@@ -315,121 +328,110 @@ def process_outlook_webhook_notification_unified(notification_data):
                 latest_msg = messages[0]
                 message_id = latest_msg.get('id')
                 conv_id = latest_msg.get('conversationId')
-                # print("Messaeg :", message_id)
                 if message_id==CURRENT_MESSAGE_ID:
                     return True
                 else:
                     CURRENT_MESSAGE_ID = message_id
-                # print(inbox_conversations_collection.find_one({'conv_id': conv_id, 'messages.message_id': message_id}))
-                if inbox_conversations_collection.find_one({'conv_id': conv_id, 'messages.message_id': message_id}):
-                    print(f"Message with ID '{message_id}' already processed. Exiting.")
-                    return True
-                conv_index = latest_msg.get('conversationIndex')
-                number_of_child_replies = decode_conversation_index(latest_msg.get('conversationIndex')).get("number of replies", '')
-                subject = latest_msg.get('subject', 'N/A')
-                # Extract sender information
-                sender_info = latest_msg.get('sender', {}).get('emailAddress', {})
-                sender = sender_info.get('address', 'N/A')
+
                 
-                # Extract all recipients (To, CC, BCC)
-                receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('toRecipients', [])]
+                process_single_mail(BASE_ENDPOINT, user_id, conv_id, headers, latest_msg, message_id)
+                # conv_index = latest_msg.get('conversationIndex')
+                # number_of_child_replies = decode_conversation_index(latest_msg.get('conversationIndex')).get("number of replies", '')
+                # subject = latest_msg.get('subject', 'N/A')
+                # # Extract sender information
+                # sender_info = latest_msg.get('sender', {}).get('emailAddress', {})
+                # sender = sender_info.get('address', 'N/A')
                 
-                cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('ccRecipients', [])]
+                # # Extract all recipients (To, CC, BCC)
+                # receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('toRecipients', [])]
+                
+                # cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('ccRecipients', [])]
 
-                bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('bccRecipients', [])]
-                msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
-                single_msg_resp = requests.get(msg_endpoint, headers=headers)
-                single_msg_resp.raise_for_status()
-                single_msg_data = single_msg_resp.json()
+                # bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('bccRecipients', [])]
+                # msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
+                # single_msg_resp = requests.get(msg_endpoint, headers=headers)
+                # single_msg_resp.raise_for_status()
+                # single_msg_data = single_msg_resp.json()
 
-                body_content = single_msg_data.get("uniqueBody", {})
-                cleaned_body = get_unique_body_outlook(body_content)
-                received_time = convert_utc_to_local(latest_msg.get('receivedDateTime', {}))
+                # body_content = single_msg_data.get("uniqueBody", {})
+                # cleaned_body = get_unique_body_outlook(body_content)
+                # received_time = convert_utc_to_local(latest_msg.get('receivedDateTime', {}))
 
-                # messages = extract_email_thread(body_plain, "From:", "差出人:")
+                # # messages = extract_email_thread(body_plain, "From:", "差出人:")
 
-                # --- NEW: Attachment Processing ---
-                inline_attachments = get_inline_attachments_outlook(body_content)
-                attachments_data = []
-                if latest_msg.get('hasAttachments') or len(inline_attachments)>0:
-                    print(f"  Message {message_id[:10]} has attachments. Fetching attachment details...")
-                    attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
-                    try:
-                        attachments_resp = requests.get(attachments_url, headers=headers)
-                        attachments_resp.raise_for_status()
-                        fetched_attachments = attachments_resp.json().get('value', [])
+                # # --- NEW: Attachment Processing ---
+                # inline_attachments = get_inline_attachments_outlook(body_content)
+                # attachments_data = []
+                # if latest_msg.get('hasAttachments') or len(inline_attachments)>0:
+                #     print(f"  Message {message_id[:10]} has attachments. Fetching attachment details...")
+                #     attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
+                #     try:
+                #         attachments_resp = requests.get(attachments_url, headers=headers)
+                #         attachments_resp.raise_for_status()
+                #         fetched_attachments = attachments_resp.json().get('value', [])
                         
-                        for attach in fetched_attachments:
-                            # Only store relevant fields and contentBytes if available
-                            attachment_info = {
-                                'id': attach.get('id'),
-                                'name': attach.get('name'),
-                                'contentType': attach.get('contentType'),
-                                'size': attach.get('size'),
-                                'isInline': attach.get('isInline', False),
-                                'contentBytes': attach.get('contentBytes') 
-                            }
-                            attachments_data.append(attachment_info)
-                        print(f"  Fetched {len(attachments_data)} attachment details for message {message_id}.")
-                    except requests.exceptions.RequestException as attach_e:
-                        print(f"  Error fetching attachments for message {message_id}: {attach_e}")
-                        if attach_e.response:
-                            print(f"  Attachment fetch error response: {attach_e.response.text}")
-                # --- END NEW: Attachment Processing ---
-                message_doc = {
-                    'message_id': message_id,
-                    'subject':subject,
-                    'conv_index':conv_index,
-                    "child_replies":number_of_child_replies,
-                    'sender': sender,
-                    'receivers': receivers_list,
-                    'cc': cc_list,
-                    'bcc': bcc_list,
-                    'body': cleaned_body,
-                    'full_message_payload': messages,
-                    'webLink': latest_msg.get('webLink'),
-                    'received_time':received_time,
-                     'attachments':attachments_data,
-                     'type':'outlook_received_mail'
-                }
-                # message_doc['type'] = 'outlook_received_mail'
-
-                # conv_doc = {
-                #     'conv_id': conv_id, 
-                #     'email_address': user_id, 
-                #     'messages':[message_doc]
+                #         for attach in fetched_attachments:
+                #             # Only store relevant fields and contentBytes if available
+                #             attachment_info = {
+                #                 'id': attach.get('id'),
+                #                 'name': attach.get('name'),
+                #                 'contentType': attach.get('contentType'),
+                #                 'size': attach.get('size'),
+                #                 'isInline': attach.get('isInline', False),
+                #                 'contentBytes': attach.get('contentBytes') 
+                #             }
+                #             attachments_data.append(attachment_info)
+                #         print(f"  Fetched {len(attachments_data)} attachment details for message {message_id}.")
+                #     except requests.exceptions.RequestException as attach_e:
+                #         print(f"  Error fetching attachments for message {message_id}: {attach_e}")
+                #         if attach_e.response:
+                #             print(f"  Attachment fetch error response: {attach_e.response.text}")
+                # # --- END NEW: Attachment Processing ---
+                # message_doc = {
+                #     'message_id': message_id,
+                #     'subject':subject,
+                #     'conv_index':conv_index,
+                #     "child_replies":number_of_child_replies,
+                #     'sender': sender,
+                #     'receivers': receivers_list,
+                #     'cc': cc_list,
+                #     'bcc': bcc_list,
+                #     'body': cleaned_body,
+                #     # 'full_message_payload': messages,
+                #     # 'webLink': latest_msg.get('webLink'),
+                #     'received_time':received_time,
+                #      'attachments':attachments_data,
+                #      'type':'outlook_received_mail'
                 # }
 
-                filter_query = {'conv_id': conv_id, 'email_address':user_id}
+                # filter_query = {'conv_id': conv_id, 'email_address':user_id}
 
-                update_operations = {
-                    '$push': {'messages': message_doc},
-                    '$setOnInsert': {
-                        'conv_id': conv_id,
-                        'email_address': user_id
-                    }
-                }
+                # update_operations = {
+                #     '$push': {'messages': message_doc},
+                #     '$setOnInsert': {
+                #         'conv_id': conv_id,
+                #         'email_address': user_id
+                #     }
+                # }
 
-                result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
+                # result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
 
-                # print(f"Matched {result.matched_count} document(s).")
-                # print(f"Modified {result.modified_count} document(s).")
-                if result.upserted_id:
-                    print(f"Inserted new document with _id: {result.upserted_id}")
-                else:
-                    print(f"Document was updated.")
+                # if result.upserted_id:
+                #     print(f"Inserted new document with _id: {result.upserted_id}")
+                # else:
+                #     print(f"Document was updated.")
                     
-                if celery_app:
-                    import workers.tasks as tasks
-                    if len(attachments_data)>0:
-                        tasks.generate_attachment_summary.delay(conv_id, message_id, user_id, 'outlook')
-                    tasks.generate_previous_emails_summary.delay(conv_id, message_id, user_id,)
-                    tasks.generate_importance_analysis.delay(conv_id, message_id, user_id)
-                    tasks.generate_summary_and_replies.delay(conv_id, message_id, user_id)
-                    # tasks.generate_category_task.delay(message_id, user_id)
-                    print(f"  Dispatched Celery tasks for Outlook message {message_id}")
-                else:
-                    print("  Celery app not initialized. Tasks not dispatched.")
+                # if celery_app:
+                #     import workers.tasks as tasks
+                #     if len(attachments_data)>0:
+                #         tasks.generate_attachment_summary.delay(conv_id, message_id, user_id, 'outlook')
+                #     tasks.generate_previous_emails_summary.delay(conv_id, message_id, user_id,)
+                #     tasks.generate_importance_analysis.delay(conv_id, message_id, user_id)
+                #     tasks.generate_summary_and_replies.delay(conv_id, message_id, user_id)
+                #     # tasks.generate_category_task.delay(message_id, user_id)
+                #     print(f"  Dispatched Celery tasks for Outlook message {message_id}")
+                # else:
+                #     print("  Celery app not initialized. Tasks not dispatched.")
                 CURRENT_MESSAGE_ID = ""
                 return True
             else:
@@ -442,6 +444,8 @@ def process_outlook_webhook_notification_unified(notification_data):
             return False
     CURRENT_MESSAGE_ID = ""
     return False
+
+
 
 # --- Unlicensed account specific authorization function ---
 def authorize_unlicensed_mail(email_address):
@@ -473,190 +477,114 @@ def authorize_unlicensed_mail(email_address):
         return True, f"Unlicensed mailbox {email_address} authorized and webhook subscription created."
     else:
         return False, f"Unlicensed mailbox {email_address} authorized, but webhook subscription failed."
-# def subscribe_to_outlook_mail_webhook(access_token, user_id):
-#     """Creates a Microsoft Graph API webhook subscription for new mail."""
-#     access_token = get_outlook_access_token(user_id)
-#     if not access_token:
-#         print(f"Failed to get access token for webhook subscription for {user_id}.")
-#         return False
-    
-#     user_data = users_collection.find_one({'user_id': user_id})
-#     account_type = user_data.get('account_type')
-
-#     headers = {
-#         'Authorization': f'Bearer {access_token}',
-#         'Content-Type': 'application/json'
-#     }
-
-#     # Determine the resource URL based on account type
-#     if account_type == 'licensed':
-#         resource_url = '/me/messages'
-#     elif account_type == 'unlicensed':
-#         resource_url = f'/users/{user_id}/messages'
-#     else:
-#         print(f"Cannot create subscription, unknown account type for {user_id}.")
-#         return False
-    
-#     dt_aware_utc = datetime.now(timezone.utc) + timedelta(minutes=Config.MS_GRAPH_WEBHOOK_EXPIRATION_MINUTES)
-#     expiration_datetime = dt_aware_utc.isoformat(timespec='microseconds')
-#     if '+' in expiration_datetime:
-#         expiration_datetime = expiration_datetime.split('+')[0]
-#     expiration_datetime += 'Z' 
-
-#     payload = {
-#         "changeType": "created",
-#         "notificationUrl": Config.MS_GRAPH_WEBHOOK_NOTIFICATION_URL,
-#         "resource": resource_url,
-#         "expirationDateTime": expiration_datetime,
-#         "clientState": user_id,
-#     }
-    
-#     # Check for existing subscription for this user
-#     existing_subscriptions_url = f"{Config.MS_GRAPH_ENDPOINT}/subscriptions"
-#     try:
-#         resp = requests.get(existing_subscriptions_url, headers=headers, json=payload)
-#         print('Resp', resp)
-#         resp.raise_for_status()
-#         existing_subs = resp.json().get('value', [])
-#         for sub in existing_subs:
-#             # Check if a subscription already exists for this resource and notification URL
-#             # Or if it's expired, delete and recreate
-#             if sub.get('resource') == '/me/messages' and sub.get('notificationUrl') == Config.MS_GRAPH_WEBHOOK_NOTIFICATION_URL:
-#                 if datetime.fromisoformat(sub.get('expirationDateTime').replace('Z', '+00:00')) > datetime.now(timezone.utc) + timedelta(hours=1):
-#                     print(f"Existing, active Outlook webhook subscription found for {user_id}: {sub.get('id')}. Skipping creation.")
-#                     return True # Subscription is active, no need to recreate
-#                 else:
-#                     print(f"Existing Outlook webhook subscription for {user_id} is near expiration or expired. Deleting...")
-#                     requests.delete(f"{Config.MS_GRAPH_ENDPOINT}/subscriptions/{sub.get('id')}", headers=headers)
-#                     print("Deleted expired subscription.")
-#         print(existing_subs)
-
-#     except requests.exceptions.RequestException as e:
-#         print(f"Error checking existing Outlook subscriptions: {e}")
-#         # Continue to try creating a new one if checking fails
-
-#     # Create new subscription
-#     # expiration_datetime =(datetime.now(timezone.utc) + timedelta(minutes=Config.MS_GRAPH_WEBHOOK_EXPIRATION_MINUTES)).isoformat(timespec='microseconds') + 'Z'
-#     # expiration_datetime =(datetime.now(timezone.utc) + timedelta(minutes=60*24)).isoformat(timespec='seconds') + 'Z'
-#     dt_aware_utc = datetime.now(timezone.utc) + timedelta(minutes=Config.MS_GRAPH_WEBHOOK_EXPIRATION_MINUTES)
-#     expiration_datetime = dt_aware_utc.isoformat(timespec='microseconds')
-#     # Remove the '+00:00' offset if present, then append 'Z'
-#     if '+' in expiration_datetime:
-#         expiration_datetime = expiration_datetime.split('+')[0]
-#     expiration_datetime += 'Z' 
-
-#     payload = {
-#         "changeType": "created", # Listen for new messages
-#         "notificationUrl": Config.MS_GRAPH_WEBHOOK_NOTIFICATION_URL,
-#         "resource": "/me/messages",
-#         "expirationDateTime": expiration_datetime,
-#         "clientState": user_id,
-	
-#     }
-#     print(payload)
-
-#     try:
-#         response = requests.post(f"{Config.MS_GRAPH_ENDPOINT}/subscriptions", headers=headers, json=payload)
-#         print("Response ", response.json())
-#         response.raise_for_status()
-#         subscription_data = response.json()
-#         print(f"Outlook webhook subscription created for {user_id}: {subscription_data.get('id')}")
-#         return True
-#     except requests.exceptions.RequestException as e:
-#         error_detail = ""
-#         if e.response:
-#             try:
-#                 error_detail = json.dumps(e.response.json(), indent=2)
-#             except json.JSONDecodeError:
-#                 error_detail = e.response.text
-#         else:
-#             error_detail = str(e) # Convert the exception object to a string
-
-#         print(f"Error creating Outlook webhook subscription for {user_id}: {e.response.status_code if e.response else 'N/A'} - {error_detail}")
-#         return False
-
-# def process_outlook_webhook_notification(notification_data):
-#     """Processes a single Microsoft Graph webhook notification."""
-#     # Ensure this is a valid change notification for a new message
-#     resource = notification_data.get('resource')
-#     change_type = notification_data.get('changeType')
-#     client_state = notification_data.get('clientState') # This is the user_id we set
-
-#     if resource and 'messages' in resource.lower() and change_type == 'created':
-#         user_id = client_state # Our user_id
-        
-#         print(f"Processing new message notification for user: {user_id}")
-        
-#         access_token = load_outlook_credentials(user_id)
-#         if access_token:
-#             try:
-#                 headers = {
-#                     'Authorization': f'Bearer {access_token}',
-#                     'Content-Type': 'application/json'
-#                 }
-#                 latest_message_url = f"{Config.MS_GRAPH_ENDPOINT}/me/messages?$top=1&$orderby=receivedDateTime desc&$select=id,subject,sender,body,webLink"
-#                 resp = requests.get(latest_message_url, headers=headers)
-#                 resp.raise_for_status()
-#                 messages = resp.json().get('value', [])
-                
-#                 if messages:
-#                     latest_msg = messages[0]
-#                     message_id = latest_msg.get('id')
-#                     subject = latest_msg.get('subject', 'N/A')
-#                     sender_email = latest_msg.get('sender', {}).get('emailAddress', {}).get('address', 'N/A')
-#                     sender_name = latest_msg.get('sender', {}).get('emailAddress', {}).get('name', '')
-#                     sender = f"{sender_name} <{sender_email}>" if sender_name else sender_email
-                    
-#                     body_content = latest_msg.get('body', {})
-#                     body_plain = body_content.get('content', 'No body available.')
-#                     if body_content.get('contentType') == 'html':
-#                         soup = BeautifulSoup(body_plain, 'html.parser')
-#                         body_plain = soup.get_text()
-#                     message_doc = {
-#                         'message_id': message_id,
-#                         'email_address': user_id,
-#                         'sender': sender,
-#                         'subject': subject,
-#                         'snippet': body_plain[:200] + '...' if len(body_plain) > 200 else body_plain,
-#                         'full_message_payload': latest_msg, # Save full payload
-#                         'webLink': latest_msg.get('webLink') # Store web link
-#                     }
-
-#                     # message_type = 'outlook_received_mail'
-#                     if sender_email.lower() == user_id.lower():
-#                         message_doc['type'] = 'outlook_sent_mail'
-#                         print(f"  Detected sent mail: {subject}")
-#                     else:
-#                         message_doc['type'] = 'outlook_received_mail'
-#                         print(f"  Detected received mail: {subject}")
-#                         # Save to database
-#                         messages_collection.update_one( # Reusing existing collection
-#                             {'message_id': message_id, 'email_address': user_id},
-#                             {'$set': message_doc},
-#                             upsert=True
-#                         )
-#                         print(f"Outlook webhook: Saved new message {message_id} for {user_id}: '{subject}'")
-
-#                         # --- Dispatch Celery tasks asynchronously ---
-#                         if celery_app: # Ensure celery_app is initialized globally in app.py and passed to utils
-#                             import workers.tasks as tasks
-#                             tasks.generate_importance_analysis.delay(message_id, user_id)
-#                             tasks.generate_summary_and_replies.delay(message_id, user_id)
-#                             tasks.generate_category_task.delay(message_id, user_id)
-#                             print(f"  Dispatched Celery tasks for Outlook message {message_id}")
-#                         else:
-#                             print("  Celery app not initialized. Tasks not dispatched.")
-
-#                     return True
-#                 else:
-#                     print(f"Outlook webhook: No latest message found for {user_id} after notification.")
-#                     return False
-#             except requests.exceptions.RequestException as e:
-#                 print(f"Outlook webhook: Error fetching latest message for {user_id} from Graph API: {e}")
-#                 return False
-#         else:
-#             print(f"Outlook webhook: Could not load access token for {user_id}. User needs to re-authenticate for full message fetch.")
-#             return False
-#     return False
 
 
+def prepare_conversation_thread(email_address, conversation_id, current_message_id):
+    # print("Preparing conversation thread", email_address)
+    user_data = users_collection.find_one({'user_id': email_address})
+    # print(user_data)
+    if not user_data:
+        print(f'No user with email {email_address} exist is the database.')
+    account_type = user_data.get('account_type')
+    BASE_ENDPOINT = get_base_endpoint(email_address, account_type)
+    headers = get_url_headers(email_address, account_type, user_data)
+    # print(BASE_ENDPOINT)
+    conversation_endpoint = f"{BASE_ENDPOINT}/messages?$filter=conversationId eq '{conversation_id}'"
+    conv_resp = requests.get(conversation_endpoint, headers=headers)
+    conv_resp.raise_for_status()
+    conv_response_data = conv_resp.json()
+                                
+    conv_messages = conv_response_data.get('value', [])
+    # print(len(conv_messages))
+    # messages = []
+    for msg in conv_messages:
+        # print(msg)
+        process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, msg, current_message_id)
+    return True
+
+
+def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, message, current_message_id):
+    message_id = message.get('id')
+    if inbox_conversations_collection.find_one({'conv_id': conversation_id, 'messages.message_id': message_id}):
+        # print(f"Message with ID '{message_id}' already processed. Exiting.")
+        return conversation_id, message_id
+    msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
+    single_msg_resp = requests.get(msg_endpoint, headers=headers)
+    single_msg_resp.raise_for_status()
+    single_msg_data = single_msg_resp.json()
+
+    conv_index = message.get('conversationIndex')
+    number_of_child_replies = decode_conversation_index(message.get('conversationIndex')).get("number of replies", '')
+    sender_info = message.get('sender', {}).get('emailAddress', {})
+    sender = sender_info.get('address', 'N/A')
+    receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in message.get('toRecipients', [])]
+    receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in message.get('toRecipients', [])]
+    cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in message.get('ccRecipients', [])]
+    bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in message.get('bccRecipients', [])]
+    body_content = single_msg_data.get("uniqueBody", {})
+    cleaned_body = get_unique_body_outlook(body_content)
+    inline_attachments = get_inline_attachments_outlook(body_content)
+    attachments_data = []
+    if message.get('hasAttachments') or len(inline_attachments)>0:
+        attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
+        try:
+            attachments_resp = requests.get(attachments_url, headers=headers)
+            attachments_resp.raise_for_status()
+            fetched_attachments = attachments_resp.json().get('value', [])
+                                            
+            for attach in fetched_attachments:
+                attachment_info = {
+                        'id': attach.get('id'),
+                        'name': attach.get('name'),
+                        'contentType': attach.get('contentType'),
+                        'size': attach.get('size'),
+                        'isInline': attach.get('isInline', False),
+                        'contentBytes': attach.get('contentBytes') 
+                    }
+                attachments_data.append(attachment_info)
+        except requests.exceptions.RequestException as attach_e:
+            print(f"  Error fetching attachments for message {message_id}: {attach_e}")
+            if attach_e.response:
+                print(f"  Attachment fetch error response: {attach_e.response.text}")
+    received_time = convert_utc_to_local(message.get('receivedDateTime', {}))
+                                    
+    message_doc = {
+            'message_id': message_id,
+            'subject':message.get('subject'),
+            'conv_index':conv_index,
+            "child_replies":number_of_child_replies,
+            'sender': sender,
+            'receivers': receivers_list,
+            'cc': cc_list,
+            'bcc': bcc_list,
+            'body': cleaned_body,
+            'full_body':message.get('body'),
+            'received_time':received_time,
+            'attachments':attachments_data,
+            'type':'outlook_received_mail'
+        }
+    filter_query = {'conv_id': conversation_id, 'email_address':email_address}
+
+    update_operations = {
+            '$push': {'messages': message_doc},
+            '$setOnInsert': {
+                'conv_id': conversation_id,
+                'email_address': email_address
+            }
+        }
+
+    result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
+
+    if celery_app:
+        if message_id==current_message_id or email_address!=sender:
+            if len(attachments_data)>0:
+                generate_attachment_summary.delay(conversation_id, message_id, email_address, 'outlook')
+            generate_previous_emails_summary.delay(conversation_id, message_id, email_address)
+            generate_importance_analysis.delay(conversation_id, message_id, email_address)
+            generate_summary_and_replies.delay(conversation_id, message_id, email_address)
+
+    if result.upserted_id:
+        print(f"Inserted new document with _id: {result.upserted_id}")
+    else:
+        print("Document updated")
+    return conversation_id, message_id
