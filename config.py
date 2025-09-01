@@ -42,7 +42,7 @@ class Config:
     MS_GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0"
     MS_GRAPH_WEBHOOK_NOTIFICATION_URL = os.getenv('MS_GRAPH_WEBHOOK_NOTIFICATION_URL') # URL where Graph sends notifications
     MS_GRAPH_WEBHOOK_EXPIRATION_MINUTES = 10070 # Max value for subscription (42300 minutes = 29 days)
-
+    MS_GRAPH_CLIENT_STATE = "jdhfg78e5t34ktjr09erjte"
     CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
     CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
     # CELERY_ACCEPT_CONTENT = ['json']

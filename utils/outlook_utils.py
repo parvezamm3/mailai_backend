@@ -8,13 +8,15 @@ from urllib.parse import urlparse, urlunparse
 from flask import session
 # from msal import ConfidentialClientApplication # pip install msal
 from config import Config
-from database import users_collection, inbox_conversations_collection # Assuming database.py provides this
+from database import users_collection, inbox_conversations_collection
+# from database_async import get_async_db
 
-from utils.transform_utils import decode_conversation_index, convert_utc_to_local
+from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
 from workers.tasks import (
     generate_attachment_summary, generate_previous_emails_summary, 
-    generate_importance_analysis, generate_summary_and_replies
+    generate_importance_analysis, generate_summary_and_replies, 
+    run_analysis_agent_stateful
 )
 
 celery_app = None
@@ -163,7 +165,7 @@ def get_outlook_message_details_graph(access_token, message_id):
         body = body_content.get('content', 'No body available.')
         if body_content.get('contentType') == 'html':
             # Basic HTML to plain text conversion (consider a more robust library for production)
-            from bs4 import BeautifulSoup # pip install beautifulsoup4
+             # pip install beautifulsoup4
             soup = BeautifulSoup(body, 'html.parser')
             body = soup.get_text()
 
@@ -218,10 +220,13 @@ def subscribe_to_outlook_mail_webhook(user_id):
     Creates a Microsoft Graph API webhook subscription for new mail.
     Dynamically uses the correct access token and resource URL.
     """
+    # db = get_async_db()
+    # users_collection_async = db[Config.MONGO_USERS_COLLECTION]
     user_data = users_collection.find_one({'user_id': user_id})
+    # print("user Data", user_data)
     account_type = user_data.get('account_type')
     headers = get_url_headers(user_id, account_type, user_data)
-
+    # print(headers)
     # Determine the resource URL based on account type
     if account_type == 'licensed':
         resource_url = "/me/mailfolders('inbox')/messages"
@@ -264,7 +269,7 @@ def extract_email_thread(text, delim1, delim2):
     match = pattern.search(text)
     if match:
         split_point = match.start()
-        print(split_point)
+        # print(split_point)
         delimiter_length = len(match.group(0))
         return [text[:split_point], text[split_point + delimiter_length:]]
     else:
@@ -272,6 +277,8 @@ def extract_email_thread(text, delim1, delim2):
 # --- Unified webhook notification processing ---
 
 def process_outlook_mail(message_id, owner_mail):
+    # db = get_async_db()
+    # users_collection_async = db[Config.MONGO_USERS_COLLECTION]
     user_data = users_collection.find_one({'user_id': owner_mail})
     # print(user_data)
     if not user_data:
@@ -293,11 +300,13 @@ def process_outlook_webhook_notification_unified(notification_data):
     """
     Processes a single Microsoft Graph webhook notification for any account type.
     """
+    # db = get_async_db()
+    # users_collection_async = db[Config.MONGO_USERS_COLLECTION]
     resource = notification_data.get('resource')
     change_type = notification_data.get('changeType')
     user_id = notification_data.get('clientState')
-    if user_id=="yokoyama_yu@ffp.co.jp":
-        return True
+    # if user_id=="yokoyama_yu@ffp.co.jp":
+    #     return True
     global CURRENT_MESSAGE_ID
     # print(f"Received change type: {change_type} for user: {user_id}")
     if resource and 'messages' in resource.lower() and change_type == 'created':
@@ -446,13 +455,14 @@ def process_outlook_webhook_notification_unified(notification_data):
     return False
 
 
-
 # --- Unlicensed account specific authorization function ---
 def authorize_unlicensed_mail(email_address):
     """
     Sets up an unlicensed mailbox for monitoring and saves its type to the database.
     This assumes an admin has already granted app permissions.
     """
+    # db = get_async_db()
+    # users_collection = db[Config.MONGO_USERS_COLLECTION]
     if not email_address:
         return False, "Email address is required."
 
@@ -480,30 +490,114 @@ def authorize_unlicensed_mail(email_address):
 
 
 def prepare_conversation_thread(email_address, conversation_id, current_message_id):
-    # print("Preparing conversation thread", email_address)
     user_data = users_collection.find_one({'user_id': email_address})
-    # print(user_data)
     if not user_data:
         print(f'No user with email {email_address} exist is the database.')
     account_type = user_data.get('account_type')
     BASE_ENDPOINT = get_base_endpoint(email_address, account_type)
     headers = get_url_headers(email_address, account_type, user_data)
-    # print(BASE_ENDPOINT)
     conversation_endpoint = f"{BASE_ENDPOINT}/messages?$filter=conversationId eq '{conversation_id}'"
     conv_resp = requests.get(conversation_endpoint, headers=headers)
     conv_resp.raise_for_status()
     conv_response_data = conv_resp.json()
                                 
     conv_messages = conv_response_data.get('value', [])
-    # print(len(conv_messages))
-    # messages = []
+    messages = []
     for msg in conv_messages:
-        # print(msg)
-        process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, msg, current_message_id)
+        message_id = msg.get('id')
+        msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
+        single_msg_resp = requests.get(msg_endpoint, headers=headers)
+        single_msg_resp.raise_for_status()
+        single_msg_data = single_msg_resp.json()
+
+        conv_index = msg.get('conversationIndex')
+        number_of_child_replies = decode_conversation_index(msg.get('conversationIndex')).get("number of replies", '')
+        subject = msg.get('subject')
+        sender_info = msg.get('sender', {}).get('emailAddress', {})
+        sender = sender_info.get('address', 'N/A')
+        receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
+        receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('toRecipients', [])]
+        cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('ccRecipients', [])]
+        bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in msg.get('bccRecipients', [])]
+        body_content = single_msg_data.get("uniqueBody", {})
+        cleaned_body = get_unique_body_outlook(body_content)
+        inline_attachments = get_inline_attachments_outlook(body_content)
+        attachments_data = []
+        if msg.get('hasAttachments') or len(inline_attachments)>0:
+            attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
+            try:
+                attachments_resp = requests.get(attachments_url, headers=headers)
+                attachments_resp.raise_for_status()
+                fetched_attachments = attachments_resp.json().get('value', [])
+                                                
+                for attach in fetched_attachments:
+                    attachment_info = {
+                            'id': attach.get('id'),
+                            'name': attach.get('name'),
+                            'contentType': attach.get('contentType'),
+                            'size': attach.get('size'),
+                            'isInline': attach.get('isInline', False),
+                            'contentBytes': attach.get('contentBytes') 
+                        }
+                    attachments_data.append(attachment_info)
+            except requests.exceptions.RequestException as attach_e:
+                print(f"  Error fetching attachments for message {message_id}: {attach_e}")
+                if attach_e.response:
+                    print(f"  Attachment fetch error response: {attach_e.response.text}")
+            received_time = convert_utc_str_to_local_datetime(msg.get('receivedDateTime'))
+            # print(received_time)                               
+            message_doc = {
+                    'message_id': message_id,
+                    'subject':subject,
+                    'conv_index':conv_index,
+                    "child_replies":number_of_child_replies,
+                    'sender': sender,
+                    'receivers': receivers_list,
+                    'cc': cc_list,
+                    'bcc': bcc_list,
+                    'body': cleaned_body,
+                    'full_body':msg.get('body'),
+                    'received_datetime':received_time,
+                    'attachments':attachments_data,
+                    'type':'outlook_received_mail'
+                }
+            filter_query = {'conv_id': conversation_id, 'email_address':email_address}
+
+            update_operations = {
+                    '$push': {'messages': message_doc},
+                    '$setOnInsert': {
+                        'conv_id': conversation_id,
+                        'email_address': email_address
+                    }
+                }
+
+            result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
+            messages.append(message_id)
+            if current_message_id==message_id :
+                email_data = {
+                    'user_email':email_address,
+                    'conv_id':conversation_id,
+                    'msg_id':message_id,
+                    'received_datetime':received_time.strftime("%Y-%m-%dT%H:%M:%S%:z"),
+                    'sender':sender,
+                    'subject':subject,
+                    'body':cleaned_body,
+                    'attachments':attachments_data,
+                    'email_provider':'gmail'
+
+                }
+
+                choices = ['importance_score', 'replies', 'summary_and_category']
+                thread_id = conversation_id+"---"+message_id
+                run_analysis_agent_stateful.delay(thread_id, email_data, choices)
+    if current_message_id not in messages:
+        process_outlook_mail(current_message_id, email_address)
     return True
 
 
 def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, message, current_message_id):
+    # db = get_async_db()
+    # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
     message_id = message.get('id')
     if inbox_conversations_collection.find_one({'conv_id': conversation_id, 'messages.message_id': message_id}):
         # print(f"Message with ID '{message_id}' already processed. Exiting.")
@@ -515,6 +609,7 @@ def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, 
 
     conv_index = message.get('conversationIndex')
     number_of_child_replies = decode_conversation_index(message.get('conversationIndex')).get("number of replies", '')
+    subject = message.get('subject')
     sender_info = message.get('sender', {}).get('emailAddress', {})
     sender = sender_info.get('address', 'N/A')
     receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in message.get('toRecipients', [])]
@@ -546,11 +641,11 @@ def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, 
             print(f"  Error fetching attachments for message {message_id}: {attach_e}")
             if attach_e.response:
                 print(f"  Attachment fetch error response: {attach_e.response.text}")
-    received_time = convert_utc_to_local(message.get('receivedDateTime', {}))
-                                    
+    received_time = convert_utc_str_to_local_datetime(message.get('receivedDateTime'))
+    print(received_time)                               
     message_doc = {
             'message_id': message_id,
-            'subject':message.get('subject'),
+            'subject':subject,
             'conv_index':conv_index,
             "child_replies":number_of_child_replies,
             'sender': sender,
@@ -559,7 +654,7 @@ def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, 
             'bcc': bcc_list,
             'body': cleaned_body,
             'full_body':message.get('body'),
-            'received_time':received_time,
+            'received_datetime':received_time,
             'attachments':attachments_data,
             'type':'outlook_received_mail'
         }
@@ -577,11 +672,27 @@ def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, 
 
     if celery_app:
         if message_id==current_message_id or email_address!=sender:
-            if len(attachments_data)>0:
-                generate_attachment_summary.delay(conversation_id, message_id, email_address, 'outlook')
-            generate_previous_emails_summary.delay(conversation_id, message_id, email_address)
-            generate_importance_analysis.delay(conversation_id, message_id, email_address)
-            generate_summary_and_replies.delay(conversation_id, message_id, email_address)
+            email_data = {
+                'user_email':email_address,
+                'conv_id':conversation_id,
+                'msg_id':message_id,
+                'received_datetime':received_time.strftime("%Y-%m-%dT%H:%M:%S%:z"),
+                'sender':sender,
+                'subject':subject,
+                'body':cleaned_body,
+                'attachments':attachments_data,
+                'email_provider':'gmail'
+
+            }
+
+            choices = ['importance_score', 'replies', 'summary_and_category']
+            thread_id = conversation_id+"---"+message_id
+            run_analysis_agent_stateful.delay(thread_id, email_data, choices)
+            # if len(attachments_data)>0:
+            #     generate_attachment_summary.delay(conversation_id, message_id, email_address, 'outlook')
+            # generate_previous_emails_summary.delay(conversation_id, message_id, email_address)
+            # generate_importance_analysis.delay(conversation_id, message_id, email_address)
+            # generate_summary_and_replies.delay(conversation_id, message_id, email_address)
 
     if result.upserted_id:
         print(f"Inserted new document with _id: {result.upserted_id}")

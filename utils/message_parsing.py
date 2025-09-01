@@ -34,43 +34,43 @@ def get_inline_attachments_outlook(body_content):
     return cid_references
 
 
-def extract_email_thread_outlook(body_content, delim1, delim2):
-    pattern = re.compile(f"({re.escape(delim1)}|{re.escape(delim2)})")
-    body_plain = body_content.get('content', 'No body available.')
-    if body_content.get('contentType') == 'html':
-        soup = BeautifulSoup(body_plain, 'html.parser')
-        # m = pattern.search(str(soup))
-        # if m:
-        #     sp = m.start()
-        #     dl = len(m.group(0))
-        #     spm = [str(soup)[:sp], str(soup)[sp + dl:]]
-        #     ns = BeautifulSoup(spm[0], 'html.parser')
-        #     cid_pattern = re.compile(r'src="cid:(.*?)"')
+# def extract_email_thread_outlook(body_content, delim1, delim2):
+#     pattern = re.compile(f"({re.escape(delim1)}|{re.escape(delim2)})")
+#     body_plain = body_content.get('content', 'No body available.')
+#     if body_content.get('contentType') == 'html':
+#         soup = BeautifulSoup(body_plain, 'html.parser')
+#         # m = pattern.search(str(soup))
+#         # if m:
+#         #     sp = m.start()
+#         #     dl = len(m.group(0))
+#         #     spm = [str(soup)[:sp], str(soup)[sp + dl:]]
+#         #     ns = BeautifulSoup(spm[0], 'html.parser')
+#         #     cid_pattern = re.compile(r'src="cid:(.*?)"')
 
-        #     # Find all matches in the HTML body
-        #     cid_references = cid_pattern.findall(spm[0])
+#         #     # Find all matches in the HTML body
+#         #     cid_references = cid_pattern.findall(spm[0])
 
-        #     # print("Found CID references:")
-        #     for cid in cid_references:
-        #         print(f"- {cid}")
-        #         # print("Main Message ---------------")
-        #         # print(ns.get_text())
+#         #     # print("Found CID references:")
+#         #     for cid in cid_references:
+#         #         print(f"- {cid}")
+#         #         # print("Main Message ---------------")
+#         #         # print(ns.get_text())
 
-        #     # print("NS------",ns )
-        cid_pattern = re.compile(r'src="cid:(.*?)"')
+#         #     # print("NS------",ns )
+#         cid_pattern = re.compile(r'src="cid:(.*?)"')
 
-        # Find all matches in the HTML body
-        cid_references = set(cid_pattern.findall(str(soup)))
+#         # Find all matches in the HTML body
+#         cid_references = set(cid_pattern.findall(str(soup)))
 
-        # print("Found CID references:")
-        for cid in cid_references:
-            print(f"- {cid}")
-        body_plain = soup.get_text().splitlines()
-        non_empty_lines = [line for line in body_plain if line.strip()]
-        print("Main body  :", "\n".join(non_empty_lines))
-    # match = pattern.search(body_plain)
-    main_body = "\n".join(non_empty_lines)
-    return main_body
+#         # print("Found CID references:")
+#         for cid in cid_references:
+#             print(f"- {cid}")
+#         body_plain = soup.get_text().splitlines()
+#         non_empty_lines = [line for line in body_plain if line.strip()]
+#         print("Main body  :", "\n".join(non_empty_lines))
+#     # match = pattern.search(body_plain)
+#     main_body = "\n".join(non_empty_lines)
+#     return main_body
 
 def extract_text_from_attachment(file_bytes, filename):
     """
@@ -177,34 +177,34 @@ def parse_email_body_and_attachments(message_payload, message_type):
             except Exception as e:
                 print(f"Error decoding simple Gmail body: {e}")
 
-    elif message_type in ['outlook_message_added', 'outlook_received_mail', 'outlook_sent_mail']:
-        # Outlook Graph API message payload structure
-        body_content = message_payload.get('body', {})
-        plain_body_content = body_content.get('content', 'No body available.')
-        if body_content.get('contentType') == 'html':
-            try:
-                soup = BeautifulSoup(plain_body_content, 'html.parser')
-                plain_body_content = soup.get_text()
-            except Exception as parse_error:
-                print(f"Error parsing HTML body for Outlook: {parse_error}")
+    # elif message_type in ['outlook_message_added', 'outlook_received_mail', 'outlook_sent_mail']:
+    #     # Outlook Graph API message payload structure
+    #     body_content = message_payload.get('body', {})
+    #     plain_body_content = body_content.get('content', 'No body available.')
+    #     if body_content.get('contentType') == 'html':
+    #         try:
+    #             soup = BeautifulSoup(plain_body_content, 'html.parser')
+    #             plain_body_content = soup.get_text()
+    #         except Exception as parse_error:
+    #             print(f"Error parsing HTML body for Outlook: {parse_error}")
         
-        # Attachments are in a separate 'attachments' array at the top level of the message payload
-        attachments = message_payload.get('attachments', [])
-        for attach in attachments:
-            if attach.get('name') and attach.get('contentBytes'):
-                try:
-                    # Outlook attachment contentBytes is standard base64 encoded
-                    decoded_bytes = base64.b64decode(attach['contentBytes'])
-                    attachments_data.append({
-                        'id': attach.get('id'),
-                        'name': attach['name'],
-                        'contentType': attach.get('contentType'),
-                        'size': attach.get('size'),
-                        'isInline': attach.get('isInline', False),
-                        'contentBytes': decoded_bytes # Store raw bytes
-                    })
-                except Exception as e:
-                    print(f"Error processing Outlook attachment {attach.get('name')}: {e}")
+    #     # Attachments are in a separate 'attachments' array at the top level of the message payload
+    #     attachments = message_payload.get('attachments', [])
+    #     for attach in attachments:
+    #         if attach.get('name') and attach.get('contentBytes'):
+    #             try:
+    #                 # Outlook attachment contentBytes is standard base64 encoded
+    #                 decoded_bytes = base64.b64decode(attach['contentBytes'])
+    #                 attachments_data.append({
+    #                     'id': attach.get('id'),
+    #                     'name': attach['name'],
+    #                     'contentType': attach.get('contentType'),
+    #                     'size': attach.get('size'),
+    #                     'isInline': attach.get('isInline', False),
+    #                     'contentBytes': decoded_bytes # Store raw bytes
+    #                 })
+    #             except Exception as e:
+    #                 print(f"Error processing Outlook attachment {attach.get('name')}: {e}")
     
     return plain_body_content, attachments_data
 

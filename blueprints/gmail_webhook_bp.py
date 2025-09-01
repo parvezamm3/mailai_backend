@@ -36,13 +36,14 @@ def gmail_webhook():
             return jsonify({"status": "error", "message": "User not authorized or token expired"}), 401
         
         # Use the historyId from the notification if no last_stored_history_id
+        # print(gmail_notification.get('historyId'))
         start_fetch_history_id = last_stored_history_id or gmail_notification.get('historyId')
         if not start_fetch_history_id:
             print(f"Cannot determine start_history_id for fetching history for {email_address}.")
             return jsonify({"status": "error", "message": "Cannot determine start_history_id"}), 400
         
         new_messages, new_latest_history_id = fetch_gmail_history(credentials, email_address, start_fetch_history_id) # Use helper
-
+        # print(new_messages, new_latest_history_id)
         # Always update the user's last_history_id with the latest one received from the API
         if new_latest_history_id:
             from database import users_collection
@@ -50,7 +51,7 @@ def gmail_webhook():
                 {'user_id': email_address},
                 {'$set': {'last_history_id': new_latest_history_id}}
             )
-            print(f"Updated last_history_id for {email_address} to {new_latest_history_id}")
+            # print(f"Updated last_history_id for {email_address} to {new_latest_history_id}")
         else:
             print(f"Warning: No new historyId returned by fetch_gmail_history for {email_address}. last_history_id not updated.")
 

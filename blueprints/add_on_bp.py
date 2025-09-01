@@ -1,16 +1,18 @@
 import json
 import requests
 import time
+import asyncio
 from bs4 import BeautifulSoup
 from flask import Blueprint, request, jsonify, send_file
 from database import preferences_collection, users_collection, inbox_messages_collection, draft_messages_collection, inbox_conversations_collection
+# from database_async import get_async_db
 from utils.outlook_utils import (
     load_outlook_credentials, send_outlook_reply_graph, 
     get_application_access_token, get_outlook_access_token,
     prepare_conversation_thread, process_outlook_mail,
     get_base_endpoint, get_url_headers
 )
-from utils.transform_utils import decode_conversation_index, convert_utc_to_local
+from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
 from utils.gmail_utils import load_google_credentials
 from utils.gemini_utils import call_gemini_api_structured_output
@@ -33,36 +35,29 @@ def get_dashboard_data():
     if not request.is_json:
         return jsonify({"status": "error", "message": "Request must be JSON"}), 400
 
+    # db = get_async_db()
+    # users_collection_async = db[Config.MONGO_USERS_COLLECTION]
+    # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
+    # preferences_collection_async = db[Config.MONGO_PREFERENCES_COLLECTION]
     data = request.get_json()
     user_id = data.get('user_id')
     owner_email = data.get('ownerEmail')
     sender = data.get('sender')
     message_id = data.get('message_id').replace('/', '-').replace('+', '_') # For Outlook messages
     conv_id = data.get('conv_id').replace('/', '-').replace('+', '_')
+    provider = data.get('provider', '')
 
     if not user_id:
         print("No User id")
         return jsonify({"status": "error", "message": "ユーザーIDが必要です。"}), 401
+    if sender == owner_email:
+        return jsonify({"status": "error", "message": "ユーザーはメールの送信者です。分析は処理されません。"}), 400
+    
     user_data = users_collection.find_one({'user_id': user_id})
     if not user_data:
         print("No User Dtata")
         return jsonify({"status": "error", "message": "このメールアドレス {user_id} を持つユーザーは存在しません。まず承認してください。"}), 401
-    # print(f"Received request for user: {user_id} and Message: {message_id}")
-    # platform = data.get('platform')
-    # if platform=='gmail':
-    #     creds, history =load_google_credentials(user_id)
-    #     # print(creds)
-    #     if not creds:
-    #         print(f"Token for user {user_id} has expired. Sending 401.")
-    #         return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
-        
-    # if platform=='outlook':
-    #     creds = load_outlook_credentials(user_id, user_data)
-    #     if not creds:
-    #         print(f"Token for user {user_id} has expired. Sending 401.")
-    #         return jsonify({"status": "error", "message": "Token has expired, please re-authorize"}), 401
 
-    # print(f"Credentials for user {user_id} are valid.")
     # --- 1. Get or Create User Preferences from MongoDB ---
     user_pref_doc = preferences_collection.find_one({'user_id': user_id})
     if not user_pref_doc:
@@ -79,72 +74,170 @@ def get_dashboard_data():
         'enable_importance': user_pref_doc.get('enable_importance', False),
         'enable_generation': user_pref_doc.get('enable_generation', False)
     }
-    is_spam = False
-    is_malicious = False
-    analysis_result = "Analysis loading..."
-    current_message_doc = inbox_conversations_collection.find_one(
-        {'conv_id': conv_id, 'messages.message_id': message_id},
-        {'_id': 0, 'messages.$': 1}
+    # 3. Determine if the conversation or message needs to be prepared
+    message_doc_exists = inbox_conversations_collection.count_documents(
+        {'conv_id': conv_id, 'messages.message_id': message_id}, limit=1
     )
-    # print(current_message_doc)
-    current_message = {}
-    analysis_data = {}
-    if current_message_doc:
-        current_message = current_message_doc['messages'][0]
-        analysis_data = current_message.get('analysis', {})
-    # print("Message Loaded")
-    generating_analsysis = False
     
-    count = 0
-    # print("Category :", analysis_data.get('category'))
-    # print(analysis_data and not analysis_data.get('category'))
-    while not analysis_data or not analysis_data.get('category'):
-        if not generating_analsysis:
+    # If the message isn't in the DB, initiate the appropriate analysis task.
+    # This logic is now outside the loop to prevent re-triggering.
+    if not message_doc_exists:
+        # First, try to prepare the full conversation thread
+        if provider=="outlook":
             prepare_conversation_thread(owner_email, conv_id, message_id)
-            generating_analsysis = True      
+            
         
+        # After attempting to get the thread, check if the specific message now exists.
+        # If not, fall back to processing the individual message.
+        # message_doc_exists_after_thread = inbox_conversations_collection.count_documents(
+        #     {'conv_id': conv_id, 'messages.message_id': message_id}, limit=1
+        # )
+        # if not message_doc_exists_after_thread:
+        #     conv_id, message_id = process_outlook_mail(message_id, owner_email)
+
+
+
+    # 4. Asynchronous Polling for Analysis Result
+    max_retries = 25
+    # print('Refresshidfjfvfjdjkdfjk')
+    for _ in range(max_retries):
         current_message_doc = inbox_conversations_collection.find_one(
             {'conv_id': conv_id, 'messages.message_id': message_id},
             {'_id': 0, 'messages.$': 1}
         )
+        
+        analysis_data = {}
         if current_message_doc:
-            # print(len(current_message_doc['messages']))
             current_message = current_message_doc['messages'][0]
             analysis_data = current_message.get('analysis', {})
-        else:
-            conv_id, message_id = process_outlook_mail(message_id, owner_email)
-        if sender==owner_email:
-            return jsonify({"status": "error", "message": "ユーザーはメールの送信者です。分析は処理されません。"}), 400
-        count+=1
-        # print(analysis_data)
-        # print(count)
-        if count>25:
-            break
+            
+            if analysis_data.get('completed'):
+                return jsonify({
+                    "status": "success",
+                    "is_spam": analysis_data.get('is_spam', False),
+                    "is_malicious": analysis_data.get('is_malicious', False),
+                    "analysis_result": f"重要度スコア: {analysis_data.get('importance_score', 'N/A')} \n 説明: {analysis_data.get('importance_description', 'Loading...')}",
+                    "preferences": preferences,
+                    'summary': analysis_data.get('summary', ''),
+                    'category': analysis_data.get('category', ''),
+                    'replies': analysis_data.get('replies', [])
+                })
+        
+        # Asynchronously wait before polling again
         time.sleep(1)
-        
-    if analysis_data:
-        is_spam = analysis_data.get('is_spam', False)
-        is_malicious = analysis_data.get('is_malicious', False)
-        importance_score = analysis_data.get('importance_score', '')
-        importance_description = analysis_data.get('importance_description', "")
-        category = analysis_data.get('category', '')
-        summary = analysis_data.get('summary', '')
-        replies = analysis_data.get('replies', [])
-        # print(replies, category)
-        
-        analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'}"
 
-        return jsonify({
-            "status": "success",
-            "is_spam":is_spam,
-            "is_malicious":is_malicious,
-            "analysis_result": analysis_result,
-            "preferences": preferences,
-            'summary':summary,
-            'category':category,
-            'replies':replies
-        })
+    # If the loop finishes without finding completed analysis
     return jsonify({"status": "error", "message": "問題が発生したか、処理に時間がかかっています。結果を表示するには画面をリフレッシュしてください。"}), 400
+    
+
+    # is_spam = False
+    # is_malicious = False
+    # analysis_result = "Analysis loading..."
+    # current_message_doc = await inbox_conversations_collection_async.find_one(
+    #     {'conv_id': conv_id, 'messages.message_id': message_id},
+    #     {'_id': 0, 'messages.$': 1}
+    # )
+    # # print(current_message_doc)
+    # current_message = {}
+    # analysis_data = {}
+    # if current_message_doc:
+    #     current_message = current_message_doc['messages'][0]
+    #     analysis_data = current_message.get('analysis', {})
+    # else:
+    #     await prepare_conversation_thread(owner_email, conv_id, message_id)
+    #     current_message_doc = await inbox_conversations_collection_async.find_one(
+    #         {'conv_id': conv_id, 'messages.message_id': message_id},
+    #         {'_id': 0, 'messages.$': 1}
+    #     )
+    #     if current_message_doc:
+    #         current_message = current_message_doc['messages'][0]
+    #         analysis_data = current_message.get('analysis', {})
+    #     else:
+    #         conv_id, message_id = await process_outlook_mail(message_id, owner_email)
+    #         current_message_doc = await inbox_conversations_collection_async.find_one(
+    #             {'conv_id': conv_id, 'messages.message_id': message_id},
+    #             {'_id': 0, 'messages.$': 1}
+    #         )
+    #         if current_message_doc:
+    #             current_message = current_message_doc['messages'][0]
+    #             analysis_data = current_message.get('analysis', {})
+
+    # if analysis_data:
+    #     is_spam = analysis_data.get('is_spam', False)
+    #     is_malicious = analysis_data.get('is_malicious', False)
+    #     importance_score = analysis_data.get('importance_score', '')
+    #     importance_description = analysis_data.get('importance_description', "")
+    #     category = analysis_data.get('category', '')
+    #     summary = analysis_data.get('summary', '')
+    #     replies = analysis_data.get('replies', [])
+    #     # print(replies, category)
+        
+    #     analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'}"
+
+    #     return jsonify({
+    #         "status": "success",
+    #         "is_spam":is_spam,
+    #         "is_malicious":is_malicious,
+    #         "analysis_result": analysis_result,
+    #         "preferences": preferences,
+    #         'summary':summary,
+    #         'category':category,
+    #         'replies':replies
+    #     })
+    # return jsonify({"status": "error", "message": "問題が発生したか、処理に時間がかかっています。結果を表示するには画面をリフレッシュしてください。"}), 400
+
+    # # print("Message Loaded")
+    # generating_analsysis = False
+    
+    # count = 0
+    # # print("Category :", analysis_data.get('category'))
+    # # print(analysis_data and not analysis_data.get('category'))
+    # while not analysis_data or not analysis_data.get('completed'):
+    #     if not generating_analsysis:
+    #         prepare_conversation_thread(owner_email, conv_id, message_id)
+    #         generating_analsysis = True      
+        
+    #     current_message_doc = inbox_conversations_collection.find_one(
+    #         {'conv_id': conv_id, 'messages.message_id': message_id},
+    #         {'_id': 0, 'messages.$': 1}
+    #     )
+    #     if current_message_doc:
+    #         current_message = current_message_doc['messages'][0]
+    #         analysis_data = current_message.get('analysis', {})
+    #     else:
+    #         conv_id, message_id = process_outlook_mail(message_id, owner_email)
+    #     if sender==owner_email:
+    #         return jsonify({"status": "error", "message": "ユーザーはメールの送信者です。分析は処理されません。"}), 400
+    #     count+=1
+    #     # print(analysis_data)
+    #     # print(count)
+    #     if count>25:
+    #         break
+    #     time.sleep(1)
+        
+    # if analysis_data:
+    #     is_spam = analysis_data.get('is_spam', False)
+    #     is_malicious = analysis_data.get('is_malicious', False)
+    #     importance_score = analysis_data.get('importance_score', '')
+    #     importance_description = analysis_data.get('importance_description', "")
+    #     category = analysis_data.get('category', '')
+    #     summary = analysis_data.get('summary', '')
+    #     replies = analysis_data.get('replies', [])
+    #     # print(replies, category)
+        
+    #     analysis_result = f"重要度スコア: {importance_score or 'N/A'} \n 説明: {importance_description or 'Loading...'}"
+
+    #     return jsonify({
+    #         "status": "success",
+    #         "is_spam":is_spam,
+    #         "is_malicious":is_malicious,
+    #         "analysis_result": analysis_result,
+    #         "preferences": preferences,
+    #         'summary':summary,
+    #         'category':category,
+    #         'replies':replies
+    #     })
+    # return jsonify({"status": "error", "message": "問題が発生したか、処理に時間がかかっています。結果を表示するには画面をリフレッシュしてください。"}), 400
 
 
 # @add_on_bp.route('/generate_analysis_outlook', methods=['POST'])
@@ -176,6 +269,7 @@ def save_preferences():
         return jsonify({"status": "error", "message": "Request must be JSON"}), 400
 
     data = request.get_json()
+    # print(data)
     user_id = data.get('user_id')
     enable_importance = data.get('enable_importance')
     enable_generation = data.get('enable_generation')
@@ -397,51 +491,6 @@ def get_email_analysis(conv_id, message_id, user_id):
         # return jsonify({"status": "not_found", "message": "Analysis not found or not yet completed."}), 404
 
 
-import re
-# def extract_email_thread(body_plain_text):
-#     """
-#     Extracts the latest message and previous conversation from an email thread.
-
-#     Args:
-#         body_plain_text (str): The plain text content of the email body.
-
-#     Returns:
-#         tuple: A tuple containing the latest message (str) and the previous conversation (str).
-#                Returns ("full_body", "") if no separator is found.
-#     """
-#     # This regex pattern looks for the standard Outlook separator line, which typically
-#     # starts with "From:". It is case-insensitive and works across multiple lines.
-#     separator_pattern = re.compile(r'^\s*(Subject:|件名:)\s*(Re:|RE:|Fwd:|FW:|転送:).*', re.MULTILINE | re.IGNORECASE)
-
-#     # Search for the first instance of the separator
-#     match = separator_pattern.search(body_plain_text)
-#     print("Body Plain Text")
-#     print(body_plain_text)
-#     print(match)
-
-#     if match:
-#         # The latest message is all the content *before* the first separator
-#         latest_message = body_plain_text[:match.start()].strip()
-#         # The previous conversation is all the content *from* the separator onward
-#         previous_conversation = body_plain_text[match.start():].strip()
-#     else:
-#         # If no separator is found, the entire body is treated as the latest message
-#         latest_message = body_plain_text.strip()
-#         previous_conversation = ""
-
-#     return latest_message, previous_conversation
-
-# def extract_email_thread(text, delim1, delim2):
-#     pattern = re.compile(f"({re.escape(delim1)}|{re.escape(delim2)})")
-#     match = pattern.search(text)
-#     if match:
-#         split_point = match.start()
-#         # print(split_point)
-#         delimiter_length = len(match.group(0))
-#         return [text[:split_point], text[split_point + delimiter_length:]]
-#     else:
-#         return [text]
-
 @add_on_bp.route('/sync_all_mail_history', methods=['POST'])
 def sync_all_mail():
     try:
@@ -616,8 +665,8 @@ def sync_all_mail():
 #                 generate_attachment_summary.delay(conversation_id, message.get('message_id'), email_address, 'outlook')
 #             generate_previous_emails_summary.delay(conversation_id, message.get('message_id'), email_address)
 
-@add_on_bp.route('/process_draft', methods=['POST'])
-def save_draft():
+@add_on_bp.route('/validate_outgoing_gmail', methods=['POST'])
+def validate_outgoing_gamil():
     """
     Receives draft data from the Apps Script, saves it as a new document
     in the MongoDB 'drafts' collection, and returns the inserted ID.
@@ -626,40 +675,98 @@ def save_draft():
         # Get the JSON data from the request body
         data = request.json
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
-
-        # Extract the necessary fields. These will become fields in our MongoDB document.
-        message_id = data.get('message_id')
-        sender = data.get('sender')
-        receiver = data.get('receiver')
-        subject = data.get('subject')
-        contents = data.get('contents')
-        drafts_at = data.get('drafts_at')
+            return jsonify({"status": "error", 'error': 'No data provided'}), 400
         
-        # Validate that all required fields are present
-        if not all([receiver, subject, contents]):
-            return jsonify({'error': 'Missing required fields: recipient, subject, or body'}), 400
+        conv_id = data.get('conv_id').replace('/', '-').replace('+', '_')
+        
+        sender = data.get('sender')
+        subject = data.get('subject')
+        body = data.get('body').split('From:')[0]
 
-        # Create a document to insert into MongoDB
-        insert_result = draft_messages_collection.insert_one(
-            {'message_id': message_id, 'sender': sender,
-                            'receiver': receiver,
-                            'subject': subject,
-                            'contents': contents,
-                            'drafts_at': drafts_at,},
-        )
+        receipients = data.get('recipients')
+        cc = data.get('cc')
+        bcc = data.get('bcc')
+        print(sender, subject, body, receipients, cc, bcc)
+        attachments = data.get('attachments')
+        attachment_names = [attachment['name'] for attachment in attachments]
+        email_address = data.get('email_address')
+        previous_emails_summary = ''
+        previous_email_sender = ''
+        previous_email_cc = []
+        previous_email_bcc = []
+        previous_email_receipients = []
+        # print(email_data['sender'])
+        if conv_id:
+            latest_message = get_latest_message_with_aggregation(conv_id, email_address)
+            latest_message_id = latest_message.get('message_id')
+            if latest_message_id:
+                previous_emails_summary = latest_message.get('previous_messages_summary', '')
+                previous_email_sender = latest_message.get('sender', '')
+                previous_email_receipients = latest_message.get('receivers', [])
+                previous_email_cc = latest_message.get('cc', [])
+                previous_email_bcc = latest_message.get('bcc', [])
+
+        # prompt = (
+        #     f"Analyze the following email and return a JSON object based on the schema. "
+        #     f"The analysis should cover four key areas: sensitive data, missing attachments, grammatical/spelling issues, and general business etiquette.\n\n"
+        #     f"Provide a True/False result for each condition. If an issue is found (e.g., True), provide a clear and concise description of the error in Japanese within 200 characters. If no issue is found (e.g., False), provide a brief explanatory comment in Japanese.\n\n"
+        #     f"**Instructions:**\n"
+        #     f"- **Sensitive Data:** Check the email body and subject for any Personally Identifiable Information (PII) or other sensitive content. **Exclude the email signature from this check, as it is considered personal information that is always present and acceptable.**\n"
+        #     f"- **Missing Attachments:** Based on the body content (e.g., phrases like 'see attached file'), determine if an attachment is mentioned but not present in the provided list. Assume the provided 'attachments' list contains the names of all files.\n"
+        #     f"- **Grammar & Spelling:** Identify all grammatical and spelling errors. Be sure to check recipient names against previous email data for consistency.\n"
+        #     f"- **Japanese Business Etiquette:** Evaluate if the email follows standard Japanese business etiquette, including appropriate use of honorifics (e.g., `様` and `さん`), formal language (`keigo`), and a respectful tone. \n\n"
+        #     f"**Email Data:**\n"
+        #     f"Subject: {subject}\n"
+        #     f"Body:\n{body}\n"
+        #     f"Attachment Names: {str(attachment_names)}\n"
+        #     f"Sender: {sender}\n"
+        #     f"Recipients: {', '.join(receipients) if isinstance(receipients, list) else receipients}\n"
+        #     f"CC: {', '.join(cc) if isinstance(cc, list) else cc}\n"
+        #     f"BCC: {', '.join(bcc) if isinstance(bcc, list) else bcc}\n\n"
+        #     f"**Previous Email Data (if available):**\n"
+        #     f"Previous Conversation Summary: {previous_emails_summary}\n"
+        #     f"Previous Email Sender: {previous_email_sender}\n"
+        #     f"Previous Email Recipients: {', '.join(previous_email_receipients)}\n"
+        #     f"Previous Email CC: {', '.join(previous_email_cc)}\n"
+        #     f"Previous Email BCC: {', '.join(previous_email_bcc)}\n\n"
+        #     f"**Output Format (JSON)**:\n"
+        #     f"{json.dumps(GEMINI_RESPONSE_SCHEMA, indent=2)}\n"
+        # )
+        # response = call_gemini_api_structured_output(prompt, GEMINI_RESPONSE_SCHEMA)
+        # Extract the necessary fields. These will become fields in our MongoDB document.
+        # message_id = data.get('message_id')
+        # sender = data.get('sender')
+        # receiver = data.get('receiver')
+        # subject = data.get('subject')
+        # contents = data.get('contents')
+        # drafts_at = data.get('drafts_at')
+        
+        # # Validate that all required fields are present
+        # if not all([receiver, subject, contents]):
+        #     return jsonify({'error': 'Missing required fields: recipient, subject, or body'}), 400
+
+        # # Create a document to insert into MongoDB
+        # insert_result = draft_messages_collection.insert_one(
+        #     {'message_id': message_id, 'sender': sender,
+        #                     'receiver': receiver,
+        #                     'subject': subject,
+        #                     'contents': contents,
+        #                     'drafts_at': drafts_at,},
+        # )
+        return jsonify({"status": "success", "message": "Email is ready to send.",}), 201
         
         # Return a success message with the ID of the new document
-        return jsonify({
-            'message': 'Draft saved successfully',
-            'saved_draft_id': str(insert_result.inserted_id), # Convert ObjectId to a string
-            'data_received': data
-        }), 201
+        # response = {
+        #     'attachments': {'comment': '本文中で添付ファイルについて言及されておらず、添付ファイルもありません。', 'has_missing_attachments': False}, 
+        #     'best_practices': {'comment': '宛名、挨拶、結びの言葉がなく、ビジネスメールとしての形式や敬語が使用されていません。非常に簡潔すぎる内容です。', 'is_not_followed': True}, 
+        #     'grammatical_errors': {'comment': '文法的な誤りはありません。', 'has_errors': True}, 
+        #     'sensitive_data': {'comment': '個人情報や機密情報は含まれていません。', 'has_sensitive_data': True}, 
+        #     'spelling_mistakes': {'comment': 'スペルミスはありません。', 'has_mistakes': False}}
+        # return jsonify({"status": "success", "message": "Email is ready to send.", "data":json.dumps(response)}), 200
 
     except Exception as e:
-        # Handle any unexpected errors
-        print(f"Error in save_draft: {e}")
-        return jsonify({'error': 'An internal server error occurred'}), 500
+        print(f"Error processing outgoing email: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred."}), 500
 
 
 def get_latest_message_with_aggregation(conversation_id, email_address):
@@ -745,27 +852,15 @@ def validate_outgoing():
         sender = email_data.get('sender')
         subject = email_data.get('subject')
         body = email_data.get('body').split('From:')[0]
-        # print(body)
-        # user_data = users_collection.find_one({'user_id': sender})
-        # # print(user_data)
-        # if not user_data:
-        #     print(f'No user with email {sender} exist is the database.')
-        # account_type = user_data.get('account_type')
-        # BASE_ENDPOINT = get_base_endpoint(sender, account_type)
-        # headers = get_url_headers(sender, account_type, user_data)
-        # msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
-        # single_msg_resp = requests.get(msg_endpoint, headers=headers)
-        # single_msg_resp.raise_for_status()
-        # single_msg_data = single_msg_resp.json()
-        # body_content = single_msg_data.get("uniqueBody", {})
-        # print(body_content)
-        # cleaned_body = get_unique_body_outlook(body_content)
-        # print(cleaned_body)
+
         receipients = email_data.get('recipients')
         cc = email_data.get('cc')
         bcc = email_data.get('bcc')
         
         attachments = email_data.get('attachments')
+        # print(attachments)
+        attachment_names = [attachment['name'] for attachment in attachments]
+        # print(attachment_names)
         email_address = email_data.get('email_address')
         previous_emails_summary = ''
         previous_email_sender = ''
@@ -794,7 +889,7 @@ def validate_outgoing():
             f"**Email Data:**\n"
             f"Subject: {subject}\n"
             f"Body:\n{body}\n"
-            f"Attachments: {str(attachments)}\n"
+            f"Attachment Names: {str(attachment_names)}\n"
             f"Sender: {sender}\n"
             f"Recipients: {', '.join(receipients) if isinstance(receipients, list) else receipients}\n"
             f"CC: {', '.join(cc) if isinstance(cc, list) else cc}\n"

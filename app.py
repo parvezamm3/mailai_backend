@@ -1,19 +1,15 @@
 import os
-from flask import Flask, redirect, url_for, session, jsonify
+from flask import Flask, redirect, url_for, session, jsonify, g
 from flask_cors import CORS
 from celery import Celery
 from msal import ConfidentialClientApplication # Import MSAL app for Outlook utils
 from config import Config
-
 from database import init_db
+
 init_db()
 
 # Global celery_app instance (will be set by create_app)
 celery_app = Celery(__name__,include=Config.CELERY_INCLUDE)
-# celery_app = Celery(__name__,
-#                     backend=Config.CELERY_RESULT_BACKEND,
-#         broker=Config.CELERY_BROKER_URL,
-#         include=['workers.tasks'])
 
 
 def make_celery(app):
@@ -33,7 +29,6 @@ def make_celery(app):
     return celery_app # Return the globally configured instance
 
 
-
 def create_app():
     """
     Flask application factory function.
@@ -49,12 +44,14 @@ def create_app():
     # Initialize Celery
     make_celery(app)
 
+
     # Import utility modules and blueprints AFTER Celery is initialized
     # This ensures that when these modules are loaded, celery_app is already available.
     import utils.gmail_utils as gmail_utils
     import utils.outlook_utils as outlook_utils
     import utils.gemini_utils as gemini_utils
     import workers.tasks as tasks
+    import utils.llm_agent as llm_agent
 
     # Pass initialized celery_app and msal_app to utility modules
     gmail_utils.celery_app = celery_app
@@ -80,7 +77,7 @@ def create_app():
     app.register_blueprint(add_on_bp)
     app.register_blueprint(outlook_auth_bp)
     app.register_blueprint(outlook_webhook_bp)
-
+    
     @app.route('/')
     def index():
         return """
@@ -101,8 +98,6 @@ def create_app():
 
 # This block is for running the Flask app directly (e.g., `python app.py`)
 if __name__ == '__main__':
-    # print("App starting")
     app = create_app()
-    # print("App running")
     app.run(debug=True, port=5000)
 

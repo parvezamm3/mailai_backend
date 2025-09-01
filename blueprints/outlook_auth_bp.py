@@ -1,5 +1,8 @@
+import secrets
+
 from flask import Blueprint, request, redirect, url_for, session, jsonify
 from config import Config
+import asyncio
 from utils.outlook_utils import msal_app, save_outlook_credentials, subscribe_to_outlook_mail_webhook, authorize_unlicensed_mail # Import the msal_app instance
 
 outlook_auth_bp = Blueprint('outlook_auth_bp', __name__)
@@ -8,7 +11,8 @@ outlook_auth_bp = Blueprint('outlook_auth_bp', __name__)
 def outlook_authorize():
     """Initiates the Microsoft Graph OAuth 2.0 authorization flow."""
     # The 'state' parameter protects against CSRF attacks
-    session['outlook_oauth_state'] = 'some_random_state_string' # Use a real random string in production
+    state = secrets.token_urlsafe(32)
+    session['outlook_oauth_state'] = state # Use a real random string in production
     
     auth_url = msal_app.get_authorization_request_url(
         scopes=Config.MS_GRAPH_SCOPES,
@@ -35,38 +39,39 @@ def outlook_oauth2callback():
     if request.args.get('code'):
         try:
             # Use MSAL to acquire token using authorization code
-            result = msal_app.acquire_token_by_authorization_code(
-                request.args['code'],
+            print("Started djfkdl")
+            result = msal_app.get_authorization_request_url(
                 scopes=Config.MS_GRAPH_SCOPES,
-                redirect_uri=Config.MS_GRAPH_REDIRECT_URI
+                redirect_uri=Config.MS_GRAPH_REDIRECT_URI,
+                state=session['outlook_oauth_state']
             )
+
+            if not isinstance(result, dict):
+                # Unexpected return; ensure result is awaited correctly
+                return jsonify({"error": "Unexpected token response."}), 500
             
-            if "access_token" in result:
-                access_token = result['access_token']
-                expires_in = result.get('expires_in')
-                user_id = result.get('id_token_claims', {}).get('preferred_username') or \
-                          result.get('id_token_claims', {}).get('email') # Get user's email/UPN
-                # print(f'Access Token {access_token} expires_in {expires_in}')
-                
-                if not user_id:
-                    print("Could not determine user_id from Outlook OAuth response.")
-                    return jsonify({"error": "Could not determine user identity."}), 500
+            access_token = result.get('access_token')
+            expires_in = result.get('expires_in')
+            user_id = (result.get('id_token_claims', {}) or {}).get('preferred_username') \
+                      or (result.get('id_token_claims', {}) or {}).get('email')
 
-                save_outlook_credentials(user_id, result, expires_in)
+            if not user_id:
+                print("Could not determine user_id from Outlook response.")
+                return jsonify({"error": "Could not determine user_id."}), 500
 
-                # Optionally subscribe to webhooks immediately after successful auth
-                if subscribe_to_outlook_mail_webhook(user_id):
-                    return jsonify({"message": f"Outlook Authorization successful for {user_id}! Webhook subscription created."})
-                else:
-                    return jsonify({"message": f"Outlook Authorization successful for {user_id}, but webhook subscription failed."}), 500
+            # Ensure these async functions are defined with async def
+            save_outlook_credentials(user_id, result, expires_in)
+            webhook_res = subscribe_to_outlook_mail_webhook(user_id)
 
+            if webhook_res:
+                return jsonify({"message": f"Outlook Authorization successful for {user_id}! Webhook subscription created."})
             else:
-                print(f"Error acquiring Outlook token: {result.get('error_description')}")
-                return jsonify({"error": f"Failed to acquire Outlook token: {result.get('error_description')}"}), 500
+                return jsonify({"message": f"Outlook Authorization successful for {user_id}, but webhook subscription failed."}), 500
 
         except Exception as e:
-            print(f"Outlook OAuth callback error: {e}")
-            return jsonify({"error": f"Failed to complete Outlook OAuth flow: {e}"}), 500
+            error_msg = f"Outlook OAuth callback error: {e}"
+            print(error_msg)
+            return jsonify({"error": error_msg}), 500
     
     return jsonify({"error": "No authorization code found."}), 400
 

@@ -4,6 +4,7 @@ import requests
 import base64
 import asyncio
 import threading
+from typing import TypedDict, Optional, List
 from bs4 import BeautifulSoup
  # Assuming this is your central message collection
 from database import inbox_messages_collection, inbox_conversations_collection
@@ -11,6 +12,10 @@ from utils.gemini_utils import call_gemini_api, call_gemini_api_structured
 # from celery import Celery, shared_task
 from app import celery_app
 from utils.attachment_processing import extract_text_from_attachment
+from utils.llm_agent import run_analysis_agent_stateful_async
+
+from app import create_app # Import your Flask app factory
+# from .some_module import some_function_that_uses_app_context
 # import app
 
 # celery_app will be set dynamically from app.py
@@ -254,8 +259,7 @@ async def _generate_attachment_summary_async(conv_id, msg_id, user_id, provider_
         }
     )
     if not message_result or not message_result.get('messages'):
-        # print('Message not found.')
-        return 'Message Not Found'
+        pass
     attachments = message_result['messages'][0].get('attachments', [])
     for attachment in attachments:
         time.sleep(2)
@@ -288,7 +292,7 @@ async def _generate_attachment_summary_async(conv_id, msg_id, user_id, provider_
         else:
             print('File is Too Large!!!')
             # return 'Extraction Failed'
-    return "Done"
+    # return "Done"
 
 
 @celery_app.task(name='tasks.generate_attachment_summary')
@@ -296,7 +300,7 @@ def generate_attachment_summary(conv_id, msg_id, user_id, provider_type):
     # run the actual async implementation in a fresh event loop
     try:
         result = run_async(_generate_attachment_summary_async(conv_id, msg_id, user_id, provider_type))
-        return result
+        return 'Done'
     except Exception as e:
         # Optionally log error, or update DB with failure
         return f'Error: {str(e)}'
@@ -352,6 +356,47 @@ def generate_previous_emails_summary(conv_id, message_id, user_id):
         # Optionally log error, or update DB with failure
         return f'Error: {str(e)}'
     
+
+async def _generate_previous_emails_summary_gmail_async(conv_id, message_id, user_id):
+    current_message_doc = inbox_conversations_collection.find_one(
+        {'conv_id': conv_id, "email_address":user_id, 'messages.message_id': message_id},
+        {'_id': 0, 'messages.$': 1}
+    )
+    current_message = current_message_doc['messages'][0]
+    previous_message_texts = current_message.get('previous_messages', '')
+
+    if previous_message_texts:
+        prompt_summary = f'Summarize the key points and unresolved issues from this previous email of this thread: {previous_message_texts} within 200 characters in Japanese. Only include Japanese, no Romaji.'
+
+        try:
+            # time.sleep(2)
+            summary = await call_gemini_api(prompt_summary)
+            inbox_conversations_collection.update_one(
+                {
+                    'conv_id': conv_id, 'email_address': user_id, 'messages.message_id':message_id
+                },
+                {
+                    '$set': {
+                    'messages.$[message].previous_messages_summary': summary,
+                    }
+                },
+                array_filters=[
+                    {"message.message_id": message_id},
+                ]
+            )
+        except Exception as e:
+            print("Gemini error occured", e)
+
+
+@celery_app.task(name='tasks.generate_previous_emails_summary_gmail')
+def generate_previous_emails_summary_gmail(conv_id, message_id, user_id):
+    try:
+        result = run_async(_generate_previous_emails_summary_gmail_async(conv_id, message_id, user_id))
+        return 'Done'
+    except Exception as e:
+        # Optionally log error, or update DB with failure
+        return f'Error: {str(e)}'
+
 
 async def _generate_importance_analysis_async(conv_id, message_id, user_id):
     """Celery task to generate importance score and description using Gemini API."""
@@ -488,7 +533,8 @@ async def _generate_importance_analysis_async(conv_id, message_id, user_id):
     print(f"Importance analysis for {message_id[:10]} completed: Score={importance_score}, Description='{importance_description[:50]}...'")
     return True
 
-  
+
+ 
 
 @celery_app.task(name='tasks.generate_importance_analysis')
 def generate_importance_analysis(conv_id, message_id, user_id):
@@ -585,4 +631,18 @@ def generate_summary_and_replies(conv_id, message_id, user_id):
         return 'Done'
     except Exception as e:
         return f'Error: {str(e)}'
+
     
+
+@celery_app.task(name='tasks.run_analysis_agent_stateful')
+def run_analysis_agent_stateful(thread_id: str, email_data: dict, choices: Optional[List[str]] = None):
+    """
+    Runs the LangGraph agent in a stateful manner.
+    """
+    # app = create_app()
+    # with app.app_context():
+    try:
+        result = run_async(run_analysis_agent_stateful_async(thread_id, email_data, choices))
+        return 'Done'
+    except Exception as e:
+        return f'Error: {str(e)}'

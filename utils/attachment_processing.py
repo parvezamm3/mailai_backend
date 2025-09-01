@@ -186,7 +186,7 @@ async def _extract_text_from_image_with_gemini(image_bytes, file_extension):
         # print(type(image_bytes))
         
         inferred_mime_type = magic.from_buffer(image_bytes, mime=True)
-        print(inferred_mime_type)
+        # print(inferred_mime_type)
         base64_encoded_bytes = base64.b64encode(image_bytes)
         base64_encoded_string = base64_encoded_bytes.decode('utf-8')
         
@@ -215,15 +215,16 @@ async def _extract_text_from_image_with_gemini(image_bytes, file_extension):
                 "temperature": 0.1
             }
         }
+        model = "gemini-2.0-flash-lite"
         
-        apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={Config.GEMINI_API_KEY}"
+        apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={Config.GEMINI_API_KEY}"
         
 
         headers = {'Content-Type': 'application/json'}
         response = await asyncio.to_thread(requests.post, apiUrl, headers=headers, json=payload)
         response.raise_for_status()
         response_data = response.json()
-        print("Image data extraction")
+        # print("Image data extraction")
         
         
         try:

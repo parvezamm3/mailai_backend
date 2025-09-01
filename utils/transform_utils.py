@@ -1,5 +1,5 @@
 import base64
-import datetime
+from datetime import datetime, timezone, timedelta
 import uuid
 import pytz
 
@@ -39,8 +39,8 @@ def decode_conversation_index(b64_index):
     # FILETIME is the number of 100-nanosecond intervals since Jan 1, 1601 UTC.
     padded_timestamp = b'\x00\x00\x00' + timestamp_bytes[::-1]  # Pad and reverse bytes
     filetime_value = int.from_bytes(padded_timestamp, byteorder='big')
-    original_timestamp = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc) + \
-                         datetime.timedelta(microseconds=filetime_value // 10)
+    original_timestamp = datetime(1601, 1, 1, tzinfo=timezone.utc) + \
+                         timedelta(microseconds=filetime_value // 10)
 
     # Convert the 16-byte GUID to a readable UUID string.
     conversation_guid = str(uuid.UUID(bytes=guid_bytes))
@@ -72,24 +72,19 @@ def decode_conversation_index(b64_index):
     }
 
 
-def convert_utc_to_local(utc_datetime_string: str):
-    """
-    Converts a UTC datetime string (ISO 8601 format) to a local datetime object.
-
-    Args:
-        utc_datetime_string: A string representing a UTC date and time,
-                             e.g., '2025-08-08T10:31:00Z'.
-
-    Returns:
-        A timezone-aware datetime object in the local system's time zone.
-    """
+def convert_utc_str_to_local_datetime(utc_datetime_string: str):
     try:
-        utc_datetime = datetime.datetime.fromisoformat(utc_datetime_string)
-        original_tz = pytz.timezone('Etc/GMT-9')
+        utc_datetime = datetime.fromisoformat(utc_datetime_string)
+        original_tz = pytz.timezone('Asia/Tokyo')
         aware_time = utc_datetime.astimezone(original_tz)
-        local_datetime = aware_time.strftime("%Y-%m-%d %H:%M:%S")
+        # local_datetime = aware_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        return local_datetime
+        return aware_time
     except ValueError as e:
         print(f"Error parsing datetime string: {e}")
-        return None
+        return datetime.now()
+
+def convert_to_local_time(utc_datetime):
+    tz = pytz.timezone('Asia/Tokyo')
+    localize_dt = tz.localize(utc_datetime)
+    return localize_dt

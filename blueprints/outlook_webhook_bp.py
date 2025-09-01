@@ -14,7 +14,7 @@ def outlook_webhook():
     try:
         # Microsoft Graph webhook validation (initial setup)
         validation_token = request.args.get('validationToken')
-        print(f"Validataion token  {validation_token}")
+        # print(f"Validataion token  {validation_token}")
         if validation_token:
             print(f"Received Outlook webhook validation request. Token: {validation_token}")
             # Respond with the validation token to confirm the endpoint
@@ -39,5 +39,5 @@ def outlook_webhook():
         return jsonify({"status": "accepted"}), 202
 
     except Exception as e:
-        print(f"Error processing Outlook webhook: {e}")
+        print(f"Top-level error processing Outlook webhook: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500

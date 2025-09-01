@@ -1,5 +1,6 @@
 # database.py
 from pymongo import MongoClient, ASCENDING
+from flask import g
 from config import Config # Import the CONFIG dictionary from config.py
 
 client = None
@@ -30,3 +31,5 @@ def init_db():
         print(f"Error connecting to MongoDB: {e}")
         # Re-raise the exception to propagate the error up to app.py
         raise
+
+    
