@@ -9,12 +9,12 @@ from database import preferences_collection, users_collection, inbox_messages_co
 from utils.outlook_utils import (
     load_outlook_credentials, send_outlook_reply_graph, 
     get_application_access_token, get_outlook_access_token,
-    prepare_conversation_thread, process_outlook_mail,
+    prepare_conversation_thread as prepare_conversation_thread_outlook, process_outlook_mail,
     get_base_endpoint, get_url_headers
 )
 from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
-from utils.gmail_utils import load_google_credentials
+from utils.gmail_utils import load_google_credentials, prepare_conversation_thread as prepare_conversation_thread_gmail
 from utils.gemini_utils import call_gemini_api_structured_output
 from workers.tasks import (
     generate_attachment_summary, generate_previous_emails_summary, generate_importance_analysis, 
@@ -84,8 +84,10 @@ def get_dashboard_data():
     if not message_doc_exists:
         # First, try to prepare the full conversation thread
         if provider=="outlook":
-            prepare_conversation_thread(owner_email, conv_id, message_id)
-            
+            prepare_conversation_thread_outlook(owner_email, conv_id, message_id)
+        if provider == "gmail":
+            preferences_collection(owner_email, conv_id, message_id)
+
         
         # After attempting to get the thread, check if the specific message now exists.
         # If not, fall back to processing the individual message.
