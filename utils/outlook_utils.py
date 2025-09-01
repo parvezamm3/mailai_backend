@@ -656,7 +656,8 @@ def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, 
             'full_body':message.get('body'),
             'received_datetime':received_time,
             'attachments':attachments_data,
-            'type':'outlook_received_mail'
+            'type':'outlook_received_mail',
+            'provider':'outlook',
         }
     filter_query = {'conv_id': conversation_id, 'email_address':email_address}
 
@@ -699,3 +700,5 @@ def process_single_mail(BASE_ENDPOINT, email_address, conversation_id, headers, 
     else:
         print("Document updated")
     return conversation_id, message_id
+
+

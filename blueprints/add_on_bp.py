@@ -12,9 +12,12 @@ from utils.outlook_utils import (
     prepare_conversation_thread as prepare_conversation_thread_outlook, process_outlook_mail,
     get_base_endpoint, get_url_headers
 )
+from utils.common_utils import conduct_analysis
 from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
-from utils.gmail_utils import load_google_credentials, prepare_conversation_thread as prepare_conversation_thread_gmail
+from utils.gmail_utils import (
+    load_google_credentials, 
+    prepare_conversation_thread as prepare_conversation_thread_gmail)
 from utils.gemini_utils import call_gemini_api_structured_output
 from workers.tasks import (
     generate_attachment_summary, generate_previous_emails_summary, generate_importance_analysis, 
@@ -46,7 +49,7 @@ def get_dashboard_data():
     message_id = data.get('message_id').replace('/', '-').replace('+', '_') # For Outlook messages
     conv_id = data.get('conv_id').replace('/', '-').replace('+', '_')
     provider = data.get('provider', '')
-
+    print(message_id[:20], provider)
     if not user_id:
         print("No User id")
         return jsonify({"status": "error", "message": "ユーザーIDが必要です。"}), 401
@@ -57,7 +60,7 @@ def get_dashboard_data():
     if not user_data:
         print("No User Dtata")
         return jsonify({"status": "error", "message": "このメールアドレス {user_id} を持つユーザーは存在しません。まず承認してください。"}), 401
-
+    print("Preliminary check succeded")
     # --- 1. Get or Create User Preferences from MongoDB ---
     user_pref_doc = preferences_collection.find_one({'user_id': user_id})
     if not user_pref_doc:
@@ -78,15 +81,17 @@ def get_dashboard_data():
     message_doc_exists = inbox_conversations_collection.count_documents(
         {'conv_id': conv_id, 'messages.message_id': message_id}, limit=1
     )
-    
+    print(f"Message Exists {message_doc_exists}")
     # If the message isn't in the DB, initiate the appropriate analysis task.
     # This logic is now outside the loop to prevent re-triggering.
     if not message_doc_exists:
         # First, try to prepare the full conversation thread
         if provider=="outlook":
+            print(f"Provider {provider}")
             prepare_conversation_thread_outlook(owner_email, conv_id, message_id)
         if provider == "gmail":
-            preferences_collection(owner_email, conv_id, message_id)
+            print(f"Provider {provider}")
+            prepare_conversation_thread_gmail(owner_email, conv_id, message_id)
 
         
         # After attempting to get the thread, check if the specific message now exists.
@@ -102,28 +107,69 @@ def get_dashboard_data():
     # 4. Asynchronous Polling for Analysis Result
     max_retries = 25
     # print('Refresshidfjfvfjdjkdfjk')
+    generating_analysis = False
     for _ in range(max_retries):
         current_message_doc = inbox_conversations_collection.find_one(
             {'conv_id': conv_id, 'messages.message_id': message_id},
             {'_id': 0, 'messages.$': 1}
         )
-        
+        # print(current_message_doc)
         analysis_data = {}
+        
         if current_message_doc:
             current_message = current_message_doc['messages'][0]
             analysis_data = current_message.get('analysis', {})
-            
-            if analysis_data.get('completed'):
-                return jsonify({
-                    "status": "success",
-                    "is_spam": analysis_data.get('is_spam', False),
-                    "is_malicious": analysis_data.get('is_malicious', False),
-                    "analysis_result": f"重要度スコア: {analysis_data.get('importance_score', 'N/A')} \n 説明: {analysis_data.get('importance_description', 'Loading...')}",
-                    "preferences": preferences,
-                    'summary': analysis_data.get('summary', ''),
-                    'category': analysis_data.get('category', ''),
-                    'replies': analysis_data.get('replies', [])
-                })
+            if not analysis_data and not generating_analysis :
+                # if provider == "gmail":
+                #     msg_doc = {
+                #         'message_id':current_message.get('message_id'),
+                #         'received_datetime':current_message.get('received_datetime'),
+                #         'sender':current_message.get('sender'),
+                #         'subject':current_message.get('subject'),
+                #         'body':current_message.get('body'),
+                #         'attachments':current_message.get('attachments'),
+                #         'provider':current_message.get('provider')
+                #     }
+                #     conduct_analysis_gmail(user_id, conv_id, msg_doc)
+                # if provider == "outlook":
+                msg_doc = {
+                    'message_id':current_message.get('message_id'),
+                    'received_datetime':current_message.get('received_datetime'),
+                    'sender':current_message.get('sender'),
+                    'subject':current_message.get('subject'),
+                    'body':current_message.get('body'),
+                    'attachments':current_message.get('attachments'),
+                    'provider':current_message.get('provider')
+                }
+                conduct_analysis(user_id, conv_id, msg_doc)
+                generating_analysis = True
+            else:
+                print("Else clause")
+                if analysis_data.get('completed'):
+                    generating_analysis = False
+                    return jsonify({
+                        "status": "success",
+                        "is_spam": analysis_data.get('is_spam', False),
+                        "is_malicious": analysis_data.get('is_malicious', False),
+                        "analysis_result": f"重要度スコア: {analysis_data.get('importance_score', 'N/A')} \n 説明: {analysis_data.get('importance_description', 'Loading...')}",
+                        "preferences": preferences,
+                        'summary': analysis_data.get('summary', ''),
+                        'category': analysis_data.get('category', ''),
+                        'replies': analysis_data.get('replies', [])
+                    })
+                
+            # else:
+            #     if provider == "gmail" and generation_required==True:
+            #         print(type(current_message.get('received_datetime')))
+            #         msg_doc = {
+            #             'message_id':current_message.get('message_id'),
+            #             'received_datetime':current_message.get('received_datetime'),
+            #             'sender':current_message.get('sender'),
+            #             'subject':current_message.get('subject'),
+            #             'body':current_message.get('body'),
+            #             'attachments':current_message.get('attachments'),
+            #         }
+            #         conduct_analysis_gmail(user_id, conv_id, msg_doc)
         
         # Asynchronously wait before polling again
         time.sleep(1)
@@ -554,7 +600,7 @@ def sync_all_mail():
                                 # print("------------Conversation-------------------")
                                 # print(conversation_id, subject)
                                 # inbox_conversations_collection.update_one
-                                prepare_conversation_thread(email_address, conversation_id, message_id)
+                                prepare_conversation_thread_outlook(email_address, conversation_id, message_id)
                             all_messages.extend(conversations)
                             
                             # Check for the next page link

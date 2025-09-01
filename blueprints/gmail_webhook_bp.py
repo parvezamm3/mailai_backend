@@ -29,7 +29,7 @@ def gmail_webhook():
         if not email_address:
             print(f"Missing emailAddress in Gmail notification: {gmail_notification}")
             return jsonify({"status": "error", "message": "Missing emailAddress"}), 400
-        
+        print(load_google_credentials(email_address))
         credentials, last_stored_history_id = load_google_credentials(email_address) # Use helper
         if not credentials:
             print(f"No credentials found for {email_address}. Cannot fetch history.")

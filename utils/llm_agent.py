@@ -383,6 +383,18 @@ async def initial_processing_and_parallel_nodes(state: AgentState):
 async def check_spam_and_malicious(state: AgentState):
     """Checks if the email is spam or malicious."""
     print("Running spam check...")
+    current_message = await inbox_conversations_collection_async.find_one(
+                {
+                    'conv_id': state['conv_id'],
+                    'email_address': state['user_email'],
+                    'messages.message_id': state['msg_id']
+                })
+    if current_message.get('analysis'):
+        print('Inside spam check if')
+        cur_spam = current_message.get('analysis').get('is_spam')
+        cur_malicious = current_message.get('analysis').get('is_malicious')
+        print(cur_spam, cur_malicious)
+        return {"spam_check_result": {'is_spam':cur_spam, 'is_malicious':cur_malicious}}
 
     prompt = (
         f"Check the mail is spam or has malicious content"

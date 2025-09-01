@@ -11,6 +11,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 
+from utils.common_utils import conduct_analysis
 from utils.message_parsing import parse_email_body_and_attachments, extract_email_thread
 from utils.transform_utils import convert_to_local_time
 # Import collections from the database module
@@ -286,20 +287,29 @@ def get_text_from_soup(part):
 
 
 def prepare_conversation_thread(email_address, thread_id, current_message_id):
-    credentials = load_google_credentials(email_address)
+    credentials, last_history_id = load_google_credentials(email_address)
+    
     gmail_service = build('gmail', 'v1', credentials=credentials)
     try:
         thread = gmail_service.users().threads().get(
             userId='me',
             id=thread_id
         ).execute()
+        print('Extraction completed')
+        # print(thread)
         messages = thread.get('messages', [])
-        user_data = users_collection.find_one({'user_id': email_address})
+        # print(messages)
+        # user_data = users_collection.find_one({'user_id': email_address})
         for msg in messages:
-            message = gmail_service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
-            result, thread_id, msg_doc = save_single_mail(gmail_service, message, email_address)
-            if msg_doc['id'] == current_message_id:
-                conduct_analysis(email_address, thread_id, msg_doc)
+            msg_id = msg.get('id')
+            if msg_id and 'TRASH' not in msg.get('labelIds', []):
+                message = gmail_service.users().messages().get(userId='me', id=msg.get('id'), format='full').execute()
+                # print(message)
+                result, thread_id, msg_doc = save_single_mail(gmail_service, message, email_address)
+                if msg_id == current_message_id:
+                    conduct_analysis(email_address, thread_id, msg_doc)
+            else:
+                print("Skipping a malformed message object without an ID.")
         return True
     except Exception as e:
         print(f"Error occured during preparing thread for gmail {e}")
@@ -349,9 +359,9 @@ def save_single_mail(gmail_service, message, email_address):
         'received_datetime':localize_dt,
         'attachments': attachments,
         'type':'gmail_received_mail',
+        'provider':'gmail',
         'full_message_payload': html_conv,
     }
-
 
     filter_query = {'conv_id': thread_id, 'email_address':email_address}
 
@@ -364,21 +374,26 @@ def save_single_mail(gmail_service, message, email_address):
     }
 
     result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
+    if result.upserted_id:
+        print(f"Inserted new document with _id: {result.upserted_id}")
+    else:
+        print(f"Document was updated.")
     return result, thread_id, message_doc
 
-def conduct_analysis(email_address, thread_id, msg_doc):
-    if celery_app:
-        email_data = {
-                'user_email':email_address,
-                'conv_id':thread_id,
-                'msg_id':msg_doc.get('message_id'),
-                'received_datetime':msg_doc.get('received_datetime', datetime.now()).strftime("%Y-%m-%dT%H:%M:%S%:z"),
-                'sender':msg_doc.get('sender'),
-                'subject':msg_doc.get('subject'),
-                'body':msg_doc.get('body'),
-                'attachments':msg_doc.get('attachments'),
-                'email_provider':'gmail'
-        }
-        choices = ['importance_score', 'replies', 'summary_and_category']
-        thread_id = thread_id+"---"+msg_doc.get('message_id')
-        run_analysis_agent_stateful.delay(thread_id, email_data, choices)
+# def conduct_analysis(email_address, thread_id, msg_doc):
+#     print(f"Conducting analysis for {msg_doc.get('message_id')} subject {msg_doc.get('subject')}")
+#     if celery_app:
+#         email_data = {
+#             'user_email':email_address,
+#             'conv_id':thread_id,
+#             'msg_id':msg_doc.get('message_id'),
+#             'received_datetime':msg_doc.get('received_datetime', datetime.now()).strftime("%Y-%m-%dT%H:%M:%S%:z"),
+#             'sender':msg_doc.get('sender'),
+#             'subject':msg_doc.get('subject'),
+#             'body':msg_doc.get('body'),
+#             'attachments':msg_doc.get('attachments'),
+#             'email_provider':'gmail'
+#         }
+#         choices = ['importance_score', 'replies', 'summary_and_category']
+#         thread_id = thread_id+"---"+msg_doc.get('message_id', '')
+#         run_analysis_agent_stateful.delay(thread_id, email_data, choices)
