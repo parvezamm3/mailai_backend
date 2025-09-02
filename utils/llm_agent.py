@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+import aiohttp
 import json
 import sqlite3
 import base64
@@ -182,11 +183,6 @@ class AgentState(TypedDict):
     conv_id:str
     msg_id:str
     user_email:str
-    # email_body: str
-    # sender: str
-    # subject: str
-    # received_datetime: str
-    # attachments: Optional[List[dict]]
     attachment_summaries: Optional[str]
     previous_conversation_summary: Optional[str]
     user_choices: List[str] # List of tasks to perform if not spam
@@ -397,21 +393,12 @@ async def initial_processing_and_parallel_nodes(state: AgentState):
 async def check_spam_and_malicious(state: AgentState):
     """Checks if the email is spam or malicious."""
     print("Running spam check...")
-    # current_message = await inbox_conversations_collection_async.find_one(
-    #             {
-    #                 'conv_id': state['conv_id'],
-    #                 'email_address': state['user_email'],
-    #                 'messages.message_id': state['msg_id']
-    #             })
     current_mail = state.get('current_mail')
     analysis = current_mail.get('analysis', {})
-    print(analysis)
     if len(analysis)!=0:
-        print('Inside spam check if')
-        cur_spam = current_mail.get('analysis', {}).get('is_spam')
-        cur_malicious = current_mail.get('analysis', {}).get('is_malicious')
-        print(cur_spam, cur_malicious)
-        if cur_spam and cur_malicious:
+        cur_spam = analysis.get('is_spam')
+        cur_malicious = analysis.get('is_malicious')
+        if cur_spam==False and cur_malicious==False:
             return {"spam_check_result": {'is_spam':cur_spam, 'is_malicious':cur_malicious}}
     body = current_mail.get('body')
     sender = current_mail.get('subject')
@@ -463,6 +450,64 @@ async def get_importance_score(state: AgentState):
         response = await asyncio.to_thread(llm_with_structured_output.invoke, [HumanMessage(prompt)])
         # print(response)
 
+        if response.score >= 70 and "helpdesk@ffp.co.jp" in current_mail.get('receivers', ''):
+                received_time = convert_to_local_time(current_mail.get('received_datetime')).strftime("%Y-%m-%d %H:%M:%S")
+                teams_payload = {
+                    "type": "message",
+                    "attachments": [
+                        {
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": {
+                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                            "type": "AdaptiveCard",
+                            "version": "1.2",
+                            "body": [
+                                {
+                                    "type": "TextBlock",
+                                    "text": "Critical Mail Alert",
+                                    "wrap": True,
+                                    "style": "heading",
+                                    "color":"attention"
+                                },
+                                {
+                                    "type": "FactSet",
+                                    "facts": [
+                                        {
+                                        "title": "件名",
+                                        "value": f"{subject}"
+                                        },
+                                        {
+                                        "title": "受信日時",
+                                        "value": f"{received_time}"
+                                        },
+                                        {
+                                        "title": "本文",
+                                        "value": f"{body}"
+                                        }
+                                    ]
+                                },
+                            ],
+                        }
+                    }
+                    ]
+                }
+
+                # Set up the headers for the request
+                teams_webhook_url = "https://prod-07.japaneast.logic.azure.com:443/workflows/7846e0ca56c44bd7a1b2aeb34ac6a4da/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=-TVc0SuSMCleLgFr2QrR2us-Jbe81poMuU3QhWHbnFo"
+                headers = {
+                    "Content-Type": "application/json"
+                }
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(teams_webhook_url, data=json.dumps(teams_payload), headers=headers) as response:
+                            response.raise_for_status()
+                            print("Message successfully sent to Teams.")
+                            return await response.text()  # or response.json() if you expect a JSON response
+                except aiohttp.ClientError as err:
+                    print(f"HTTP Error: {err}")
+                except Exception as e:
+                    print(f"An error occurred: {e}")
+
         return {"importance_score_result": {'score':response.score, 'description':response.description}}
     except Exception as e:
         print(f"Error invoking Gemini with structured output for importance score: {e}")
@@ -475,7 +520,7 @@ async def suggest_replies(state: AgentState):
     body = current_mail.get('body')
     sender = current_mail.get('sender')
     subject = current_mail.get('subject')
-    print(body, sender)
+    # print(body, sender)
     prompt = (
         f"Analyze the following email content and determine if reply needed or not."
         f"If a reply is needed, generate three reply options in Business Japanese: 'Concise', 'Confirm', and 'Polite'.\n"
@@ -511,7 +556,7 @@ async def summarize_and_categorize_email(state: AgentState):
     body = current_mail.get('body')
     sender = current_mail.get('sender')
     subject = current_mail.get('subject')
-    print(body, sender)
+    # print(body, sender)
     prompt = (
         f"Provide a concise summary (2-3 sentences) of the email and its context within the conversation history in Japanese."
         f"Categorize the email into one of the following categories in Japanese: "
@@ -567,6 +612,7 @@ def spam_router(state: AgentState) -> str:
     If spam, the graph ends. Otherwise, it proceeds to other analyses.
     """
     print("Spam router")
+    print(state.get("spam_check_result"))
     if state.get("spam_check_result"):
         if state['spam_check_result'].get('is_spam') or state['spam_check_result'].get('is_malicious'):
             print("Spam detected. Ending analysis.")
