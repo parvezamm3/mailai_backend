@@ -139,36 +139,36 @@ def fetch_gmail_history(credentials, email_address, start_history_id):
                                 print(f"Document was updated.")
                             # print(f"  Processed and saved Gmail message: ID={message_id}, From='{sender}', Subject='{subject}'")
                             # processed_messages.append(message_doc)
-
+                            conduct_analysis(email_address, thread_id, msg_doc)
                             # --- Dispatch Celery tasks asynchronously ---
-                            if celery_app: # Ensure celery_app is initialized globally in app.py and passed to utils
-                                # import workers.tasks as tasks
-                                # print(thread_id, message_id, email_address)
+                            # if celery_app: # Ensure celery_app is initialized globally in app.py and passed to utils
+                            #     # import workers.tasks as tasks
+                            #     # print(thread_id, message_id, email_address)
                                 
-                                email_data = {
-                                     'user_email':email_address,
-                                     'conv_id':thread_id,
-                                     'msg_id':message_id,
-                                     'received_datetime':msg_doc.get('received_datetime', datetime.now()).strftime("%Y-%m-%dT%H:%M:%S%:z"),
-                                     'sender':msg_doc.get('sender'),
-                                     'subject':msg_doc.get('subject'),
-                                     'body':msg_doc.get('body'),
-                                     'attachments':msg_doc.get('attachments'),
-                                     'email_provider':'gmail'
+                            #     email_data = {
+                            #          'user_email':email_address,
+                            #          'conv_id':thread_id,
+                            #          'msg_id':message_id,
+                            #          'received_datetime':msg_doc.get('received_datetime', datetime.now()).strftime("%Y-%m-%dT%H:%M:%S%:z"),
+                            #          'sender':msg_doc.get('sender'),
+                            #          'subject':msg_doc.get('subject'),
+                            #          'body':msg_doc.get('body'),
+                            #          'attachments':msg_doc.get('attachments'),
+                            #          'email_provider':'gmail'
 
-                                }
+                            #     }
 
-                                choices = ['importance_score', 'replies', 'summary_and_category']
-                                thread_id = thread_id+"---"+message_id
-                                run_analysis_agent_stateful.delay(thread_id, email_data, choices)
-                                # if len(attachments)>0:
-                                #     generate_attachment_summary.delay(thread_id, message_id, email_address, 'gmail')
-                                # generate_previous_emails_summary_gmail.delay(thread_id, message_id, email_address,)
-                                # generate_importance_analysis.delay(thread_id, message_id, email_address,)
-                                # generate_summary_and_replies.delay(thread_id, message_id, email_address,)
-                                print(f"  Dispatched Celery tasks for Gmail message {message_id}")
-                            else:
-                                print("  Celery app not initialized. Tasks not dispatched.")
+                            #     choices = ['importance_score', 'replies', 'summary_and_category']
+                            #     thread_id = thread_id+"---"+message_id
+                            #     run_analysis_agent_stateful.delay(thread_id, email_data, choices)
+                            #     # if len(attachments)>0:
+                            #     #     generate_attachment_summary.delay(thread_id, message_id, email_address, 'gmail')
+                            #     # generate_previous_emails_summary_gmail.delay(thread_id, message_id, email_address,)
+                            #     # generate_importance_analysis.delay(thread_id, message_id, email_address,)
+                            #     # generate_summary_and_replies.delay(thread_id, message_id, email_address,)
+                            #     print(f"  Dispatched Celery tasks for Gmail message {message_id}")
+                            # else:
+                            #     print("  Celery app not initialized. Tasks not dispatched.")
                         # print("This message is not from inbox")
                         pass
                     except HttpError as msg_error:
@@ -182,10 +182,10 @@ def fetch_gmail_history(credentials, email_address, start_history_id):
         return history_response.get('historyId', start_history_id)
     except HttpError as error:
         print(f"Error fetching Gmail history for {email_address}: {error}")
-        return [], start_history_id
+        return start_history_id
     except Exception as e:
         print(f"An unexpected error occurred while fetching history: {e}")
-        return [], start_history_id
+        return start_history_id
     
 
 def parse_message_parts(parts, attachments, gmail_service, message_id):
@@ -346,6 +346,10 @@ def save_single_mail(gmail_service, message, email_address):
     main_conv, prev_conv, html_conv, attachments = parse_message_parts(
         payload.get('parts', []), attachments, gmail_service, message_id
     )
+
+    analysis = {
+        'completed':False
+    }
     
     message_doc = {
         'message_id': message_id,
@@ -361,7 +365,9 @@ def save_single_mail(gmail_service, message, email_address):
         'type':'gmail_received_mail',
         'provider':'gmail',
         'full_message_payload': html_conv,
+        'analysis':analysis
     }
+    
 
     filter_query = {'conv_id': thread_id, 'email_address':email_address}
 

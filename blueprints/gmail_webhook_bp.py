@@ -29,7 +29,7 @@ def gmail_webhook():
         if not email_address:
             print(f"Missing emailAddress in Gmail notification: {gmail_notification}")
             return jsonify({"status": "error", "message": "Missing emailAddress"}), 400
-        print(load_google_credentials(email_address))
+        # print(load_google_credentials(email_address))
         credentials, last_stored_history_id = load_google_credentials(email_address) # Use helper
         if not credentials:
             print(f"No credentials found for {email_address}. Cannot fetch history.")
@@ -42,7 +42,7 @@ def gmail_webhook():
             print(f"Cannot determine start_history_id for fetching history for {email_address}.")
             return jsonify({"status": "error", "message": "Cannot determine start_history_id"}), 400
         
-        new_messages, new_latest_history_id = fetch_gmail_history(credentials, email_address, start_fetch_history_id) # Use helper
+        new_latest_history_id = fetch_gmail_history(credentials, email_address, start_fetch_history_id) # Use helper
         # print(new_messages, new_latest_history_id)
         # Always update the user's last_history_id with the latest one received from the API
         if new_latest_history_id:

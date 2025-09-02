@@ -178,14 +178,15 @@ class AgentState(TypedDict):
     The state persists across multiple requests for the same email.
     """
     email_provider:str
+    current_mail:dict
     conv_id:str
     msg_id:str
     user_email:str
-    email_body: str
-    sender: str
-    subject: str
-    received_datetime: str
-    attachments: Optional[List[dict]]
+    # email_body: str
+    # sender: str
+    # subject: str
+    # received_datetime: str
+    # attachments: Optional[List[dict]]
     attachment_summaries: Optional[str]
     previous_conversation_summary: Optional[str]
     user_choices: List[str] # List of tasks to perform if not spam
@@ -204,7 +205,9 @@ async def generate_attachment_summary(state: AgentState):
     Generates a summary for each attachment in parallel and saves it to the state.
     """
     print("Starting parallel attachment summary generation...")
-    attachments = state.get('attachments', [])
+    # attachments = state.get('attachments', [])
+    current_mail = state.get('current_mail')
+    attachments = current_mail.get('attachments', [])
     if not attachments:
         print("No attachments found. Skipping summary generation.")
         return {"attachment_summaries": "No Attachment"}
@@ -213,6 +216,11 @@ async def generate_attachment_summary(state: AgentState):
         """Helper function to process a single attachment asynchronously."""
         # db = get_async_db()
         # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
+        name = attachment.get('name')
+        summary = attachment.get('attachment_summary')
+        if summary:
+            return {"name": name, "summary": summary}
+        # else:
         attachment_id = attachment.get('id')
         attachment_size = attachment.get('size')
         if attachment_size < 1200000:
@@ -245,7 +253,7 @@ async def generate_attachment_summary(state: AgentState):
                             ]
                         )
                         print(f"DB Update: Saved summary for attachment '{attachment_id}' in thread '{conv_id}'")
-                        return {"name": attachment.get('name'), "summary": attachment_summary}
+                        return {"name": name, "summary": attachment_summary}
                 except Exception as e:
                     print(f"Gemini error occurred for attachment {attachment_id}: {e}")
             else:
@@ -279,10 +287,16 @@ async def generate_previous_conversation_summary(state:AgentState):
     print("Generation of previous summary started")
     # db = get_async_db()
     # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
-    try:
-        current_received_time = datetime.fromisoformat(state["received_datetime"])
-    except ValueError:
-        current_received_time = state["received_datetime"]
+    current_mail = state.get('current_mail')
+    if current_mail.get('previous_messages_summary'):
+        return {"previous_conversation_summary": current_mail.get('previous_messages_summary')}
+    # else:
+        # try:
+        #     current_received_time = datetime.fromisoformat(state["received_datetime"])
+        # except ValueError:
+        #     current_received_time = state["received_datetime"]
+    current_received_time = current_mail.get('received_datetime')
+    print(current_received_time)
     try:
         pipeline = [
             { "$match": {
@@ -326,7 +340,7 @@ async def generate_previous_conversation_summary(state:AgentState):
         else:
             previous_messages_summaries = ""
             for message in previous_messages:
-                # assuming message.received_datetime is a datetime object
+                # assuming message.received_datetime is a datetime objec
                 received_time_str = convert_to_local_time(message['received_datetime']).strftime("%Y-%m-%d %H:%M:%S")
                 logger.info("Received datetime %s", received_time_str)
                 previous_messages_summaries += f"Received Time : {received_time_str}\t\tMail Summary: {message.get("analysis", {}).get('summary','')}"
@@ -383,26 +397,32 @@ async def initial_processing_and_parallel_nodes(state: AgentState):
 async def check_spam_and_malicious(state: AgentState):
     """Checks if the email is spam or malicious."""
     print("Running spam check...")
-    current_message = await inbox_conversations_collection_async.find_one(
-                {
-                    'conv_id': state['conv_id'],
-                    'email_address': state['user_email'],
-                    'messages.message_id': state['msg_id']
-                })
-    if current_message.get('analysis'):
+    # current_message = await inbox_conversations_collection_async.find_one(
+    #             {
+    #                 'conv_id': state['conv_id'],
+    #                 'email_address': state['user_email'],
+    #                 'messages.message_id': state['msg_id']
+    #             })
+    current_mail = state.get('current_mail')
+    analysis = current_mail.get('analysis', {})
+    print(analysis)
+    if len(analysis)!=0:
         print('Inside spam check if')
-        cur_spam = current_message.get('analysis').get('is_spam')
-        cur_malicious = current_message.get('analysis').get('is_malicious')
+        cur_spam = current_mail.get('analysis', {}).get('is_spam')
+        cur_malicious = current_mail.get('analysis', {}).get('is_malicious')
         print(cur_spam, cur_malicious)
-        return {"spam_check_result": {'is_spam':cur_spam, 'is_malicious':cur_malicious}}
-
+        if cur_spam and cur_malicious:
+            return {"spam_check_result": {'is_spam':cur_spam, 'is_malicious':cur_malicious}}
+    body = current_mail.get('body')
+    sender = current_mail.get('subject')
+    subject = current_mail.get('subject')
     prompt = (
         f"Check the mail is spam or has malicious content"
         f"Your response must be a single JSON object."
         "The JSON should have two keys: 'is_spam' and 'is_malicious', with boolean values.\n"
-        f'Sender: {state['sender']}\n'
-        f'Subject: {state['subject']}\n'
-        f'Body:\n{state['email_body']}\n\n'
+        f'Sender: {sender}\n'
+        f'Subject: {subject}\n'
+        f'Body:\n{body}\n\n'
     )
     if state.get("attachment_summaries") and state["attachment_summaries"] != "No Attachment":
         prompt+=f'Summary Of The Attachments :\n{state["attachment_summaries"]}\n\n'
@@ -413,7 +433,7 @@ async def check_spam_and_malicious(state: AgentState):
         # gemini_llm_2 = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
         llm_with_structured_output = gemini_llm.with_structured_output(SpamCheckResult)
         response = await asyncio.to_thread(llm_with_structured_output.invoke, [HumanMessage(prompt)])
-        print(response)
+        # print(response)
         return {"spam_check_result": {'is_spam':response.is_spam, 'is_malicious':response.is_malicious}}
     except Exception as e:
         print(f"Error invoking Gemini with structured output for spam check: {e}")
@@ -423,12 +443,16 @@ async def check_spam_and_malicious(state: AgentState):
 async def get_importance_score(state: AgentState):
     """Assigns an importance score to the email."""
     print("Running importance score analysis...")
+    current_mail = state.get('current_mail')
+    body = current_mail.get('body')
+    subject = current_mail.get('subject')
     prompt = (
         f"Assign an importance score from 0-100 based on these rules: {CONDITION_RULES} in the following email."
         f'Then, Provide a one-sentence summary *within 100 characters* describing the reason behind the scoring in Japanese.'
         f'If any keyword or its synonymous text from the conditions exists in the mail, score it corresponding to its category and mention the keyword in the description.'
         f"Your response must be a single JSON object. The JSON should have two keys: 'score' (number) and 'description' (string).\n\n"
-        f'Body:\n{state['email_body']}\n\n'
+        f'Subject: {subject}\n'
+        f'Body:\n{body}n\n'
     )
     if state.get("attachment_summaries"):
         prompt+=f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
@@ -447,6 +471,11 @@ async def get_importance_score(state: AgentState):
 async def suggest_replies(state: AgentState):
     """Suggests three business Japanese replies for the email."""
     print("Running reply suggestions...")
+    current_mail = state.get('current_mail')
+    body = current_mail.get('body')
+    sender = current_mail.get('sender')
+    subject = current_mail.get('subject')
+    print(body, sender)
     prompt = (
         f"Analyze the following email content and determine if reply needed or not."
         f"If a reply is needed, generate three reply options in Business Japanese: 'Concise', 'Confirm', and 'Polite'.\n"
@@ -454,8 +483,9 @@ async def suggest_replies(state: AgentState):
         f"Each reply object should have 'type' (enum: 'Concise', 'Confirm', 'Polite') and 'text' (string).\n"
         f"You must format the reply text to be highly readable. Insert newline characters (`\n`) for clarity.\n"
         f"If no reply is needed, the 'replies' array should be empty.\n\n"
-        f'Sender: {state['sender']}\n'
-        f'Body:\n{state['email_body']}\n\n'
+        f'Sender: {sender}\n'
+        f'Subject: {subject}\n'
+        f'Body:\n{body}\n\n'
     )
     if state.get("attachment_summaries"):
         prompt+=f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
@@ -477,14 +507,20 @@ async def suggest_replies(state: AgentState):
 async def summarize_and_categorize_email(state: AgentState):
     """Categorizes the email into a predefined category."""
     print("Running email categorization...")
+    current_mail = state.get('current_mail')
+    body = current_mail.get('body')
+    sender = current_mail.get('sender')
+    subject = current_mail.get('subject')
+    print(body, sender)
     prompt = (
         f"Provide a concise summary (2-3 sentences) of the email and its context within the conversation history in Japanese."
         f"Categorize the email into one of the following categories in Japanese: "
-        f"'問い合わせ', '報告', etc.\n\n{state['email_body']}"
+        f"'問い合わせ', '報告', etc.\n\n{body}"
         f"'エラー' (Error), '修理' (Repair), '問い合わせ' (Inquiry), '報告' (Report), 'キャンペーン' (Campaign),'お知らせ' (Notice), 'プロモーション' (Promotion), 'スパム' (Spam), '有害' (Harmful), '返信不要' (No reply needed)."
         f"Your response must be a single JSON object. The JSON should have two keys: 'summary' (string) and 'category' (string).\n\n"
-        f'Sender: {state['sender']}\n'
-        f'Body:\n{state['email_body']}\n\n'
+        f'Sender: {sender}\n'
+        f'Subject: {subject}\n'
+        f'Body:\n{body}\n\n'
     )
     if state.get("attachment_summaries"):
         prompt+=f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
@@ -580,17 +616,21 @@ async def run_analysis_agent_stateful_async(thread_id: str, email_data: dict, ch
     async with aiosqlite.connect(":memory:") as conn:
         sqlite_saver = AsyncSqliteSaver(conn=conn)
         config = {"configurable": {"thread_id": thread_id}, "checkpointer": sqlite_saver}
+        current_mail_doc = await inbox_conversations_collection_async.find_one(
+            {'conv_id': email_data.get('conv_id'), "email_address":email_data.get('user_email'), 'messages.message_id': email_data.get('msg_id')},
+            {'_id': 0, 'messages.$': 1}
+        )
+        current_mail = current_mail_doc['messages'][0]
         
         initial_state = {
             'email_provider':email_data['email_provider'],
-            'email_body': email_data['body'],
-            'sender': email_data['sender'],
-            'subject': email_data['subject'],
+            'current_mail':current_mail,
+            # 'subject': email_data['subject'],
             'conv_id': email_data.get('conv_id'),
             'user_email': email_data.get('user_email'),
             'msg_id': email_data.get('msg_id'),
-            'received_datetime': email_data.get('received_datetime'),
-            'attachments': email_data.get('attachments', []),
+            # 'received_datetime': email_data.get('received_datetime'),
+            # 'attachments': email_data.get('attachments', []),
             'previous_conversation_summary': None,
             'user_choices': choices if choices is not None else [],
             'attachment_summaries': None,
