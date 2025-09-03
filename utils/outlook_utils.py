@@ -4,20 +4,12 @@ import re
 
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, urlunparse
-from flask import session
-# from msal import ConfidentialClientApplication # pip install msal
+
 from config import Config
 from database import users_collection, inbox_conversations_collection
-# from database_async import get_async_db
 from utils.common_utils import conduct_analysis
-from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime
+from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime, convert_to_local_time
 from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
-from workers.tasks import (
-    generate_attachment_summary, generate_previous_emails_summary,
-    generate_importance_analysis, generate_summary_and_replies,
-    run_analysis_agent_stateful
-)
 
 celery_app = None
 msal_app = None
@@ -179,8 +171,6 @@ def get_outlook_message_details_graph(access_token, message_id):
         body_content = message_data.get('body', {})
         body = body_content.get('content', 'No body available.')
         if body_content.get('contentType') == 'html':
-            # Basic HTML to plain text conversion (consider a more robust library for production)
-            # pip install beautifulsoup4
             soup = BeautifulSoup(body, 'html.parser')
             body = soup.get_text()
 
@@ -303,14 +293,10 @@ def extract_email_thread(text, delim1, delim2):
         return [text[:split_point], text[split_point + delimiter_length:]]
     else:
         return [text]
-# --- Unified webhook notification processing ---
 
 
 def process_outlook_mail(message_id, owner_mail):
-    # db = get_async_db()
-    # users_collection_async = db[Config.MONGO_USERS_COLLECTION]
     user_data = users_collection.find_one({'user_id': owner_mail})
-    # print(user_data)
     if not user_data:
         print(f'No user with email {owner_mail} exist is the database.')
     account_type = user_data.get('account_type')
@@ -322,33 +308,25 @@ def process_outlook_mail(message_id, owner_mail):
     msg_data = msg_resp.json()
 
     conv_id = msg_data.get('conversationId')
-    new_conv_id, new_msg_id = process_single_mail(owner_mail, conv_id, msg_data, user_data)
+    new_conv_id, new_msg_id = process_single_mail(
+        owner_mail, conv_id, msg_data, user_data)
     return new_conv_id, new_msg_id
 
 
 CURRENT_MESSAGE_ID = ""
 
+
 def process_outlook_webhook_notification_unified(notification_data):
     """
     Processes a single Microsoft Graph webhook notification for any account type.
     """
-    # db = get_async_db()
-    # users_collection_async = db[Config.MONGO_USERS_COLLECTION]
     resource = notification_data.get('resource')
     change_type = notification_data.get('changeType')
     user_id = notification_data.get('clientState')
-    # if user_id=="yokoyama_yu@ffp.co.jp":
-    #     return True
     global CURRENT_MESSAGE_ID
     # print(f"Received change type: {change_type} for user: {user_id}")
     if resource and 'messages' in resource.lower() and change_type == 'created':
         print(f"Processing new message notification for user: {user_id}")
-        # access_token = get_outlook_access_token(user_id)
-        # if not access_token:
-        #     print(f"Could not load access token for {user_id}.")
-        #     return False
-
-        # headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
         user_data = users_collection.find_one({'user_id': user_id})
         account_type = user_data.get('account_type')
         headers = get_url_headers(user_id, account_type, user_data)
@@ -374,103 +352,7 @@ def process_outlook_webhook_notification_unified(notification_data):
                     CURRENT_MESSAGE_ID = message_id
 
                 process_single_mail(user_id, conv_id, latest_msg, user_data)
-                # conv_index = latest_msg.get('conversationIndex')
-                # number_of_child_replies = decode_conversation_index(latest_msg.get('conversationIndex')).get("number of replies", '')
-                # subject = latest_msg.get('subject', 'N/A')
-                # # Extract sender information
-                # sender_info = latest_msg.get('sender', {}).get('emailAddress', {})
-                # sender = sender_info.get('address', 'N/A')
 
-                # # Extract all recipients (To, CC, BCC)
-                # receivers_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('toRecipients', [])]
-
-                # cc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('ccRecipients', [])]
-
-                # bcc_list = [r.get('emailAddress', {}).get('address', 'N/A') for r in latest_msg.get('bccRecipients', [])]
-                # msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
-                # single_msg_resp = requests.get(msg_endpoint, headers=headers)
-                # single_msg_resp.raise_for_status()
-                # single_msg_data = single_msg_resp.json()
-
-                # body_content = single_msg_data.get("uniqueBody", {})
-                # cleaned_body = get_unique_body_outlook(body_content)
-                # received_time = convert_utc_to_local(latest_msg.get('receivedDateTime', {}))
-
-                # # messages = extract_email_thread(body_plain, "From:", "差出人:")
-
-                # # --- NEW: Attachment Processing ---
-                # inline_attachments = get_inline_attachments_outlook(body_content)
-                # attachments_data = []
-                # if latest_msg.get('hasAttachments') or len(inline_attachments)>0:
-                #     print(f"  Message {message_id[:10]} has attachments. Fetching attachment details...")
-                #     attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
-                #     try:
-                #         attachments_resp = requests.get(attachments_url, headers=headers)
-                #         attachments_resp.raise_for_status()
-                #         fetched_attachments = attachments_resp.json().get('value', [])
-
-                #         for attach in fetched_attachments:
-                #             # Only store relevant fields and contentBytes if available
-                #             attachment_info = {
-                #                 'id': attach.get('id'),
-                #                 'name': attach.get('name'),
-                #                 'contentType': attach.get('contentType'),
-                #                 'size': attach.get('size'),
-                #                 'isInline': attach.get('isInline', False),
-                #                 'contentBytes': attach.get('contentBytes')
-                #             }
-                #             attachments_data.append(attachment_info)
-                #         print(f"  Fetched {len(attachments_data)} attachment details for message {message_id}.")
-                #     except requests.exceptions.RequestException as attach_e:
-                #         print(f"  Error fetching attachments for message {message_id}: {attach_e}")
-                #         if attach_e.response:
-                #             print(f"  Attachment fetch error response: {attach_e.response.text}")
-                # # --- END NEW: Attachment Processing ---
-                # message_doc = {
-                #     'message_id': message_id,
-                #     'subject':subject,
-                #     'conv_index':conv_index,
-                #     "child_replies":number_of_child_replies,
-                #     'sender': sender,
-                #     'receivers': receivers_list,
-                #     'cc': cc_list,
-                #     'bcc': bcc_list,
-                #     'body': cleaned_body,
-                #     # 'full_message_payload': messages,
-                #     # 'webLink': latest_msg.get('webLink'),
-                #     'received_time':received_time,
-                #      'attachments':attachments_data,
-                #      'type':'outlook_received_mail'
-                # }
-
-                # filter_query = {'conv_id': conv_id, 'email_address':user_id}
-
-                # update_operations = {
-                #     '$push': {'messages': message_doc},
-                #     '$setOnInsert': {
-                #         'conv_id': conv_id,
-                #         'email_address': user_id
-                #     }
-                # }
-
-                # result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
-
-                # if result.upserted_id:
-                #     print(f"Inserted new document with _id: {result.upserted_id}")
-                # else:
-                #     print(f"Document was updated.")
-
-                # if celery_app:
-                #     import workers.tasks as tasks
-                #     if len(attachments_data)>0:
-                #         tasks.generate_attachment_summary.delay(conv_id, message_id, user_id, 'outlook')
-                #     tasks.generate_previous_emails_summary.delay(conv_id, message_id, user_id,)
-                #     tasks.generate_importance_analysis.delay(conv_id, message_id, user_id)
-                #     tasks.generate_summary_and_replies.delay(conv_id, message_id, user_id)
-                #     # tasks.generate_category_task.delay(message_id, user_id)
-                #     print(f"  Dispatched Celery tasks for Outlook message {message_id}")
-                # else:
-                #     print("  Celery app not initialized. Tasks not dispatched.")
                 CURRENT_MESSAGE_ID = ""
                 return True
             else:
@@ -537,223 +419,29 @@ def prepare_conversation_thread(email_address, conversation_id, current_message_
     messages = []
     for msg in conv_messages:
         message_id = msg.get('id')
-        result, message_doc = save_single_mail(msg, email_address, conversation_id, user_data)
-        # msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
-        # single_msg_resp = requests.get(msg_endpoint, headers=headers)
-        # single_msg_resp.raise_for_status()
-        # single_msg_data = single_msg_resp.json()
-
-        # conv_index = msg.get('conversationIndex')
-        # number_of_child_replies = decode_conversation_index(
-        #     msg.get('conversationIndex')).get("number of replies", '')
-        # subject = msg.get('subject')
-        # sender_info = msg.get('sender', {}).get('emailAddress', {})
-        # sender = sender_info.get('address', 'N/A')
-        # receivers_list = [r.get('emailAddress', {}).get(
-        #     'address', 'N/A') for r in msg.get('toRecipients', [])]
-        # receivers_list = [r.get('emailAddress', {}).get(
-        #     'address', 'N/A') for r in msg.get('toRecipients', [])]
-        # cc_list = [r.get('emailAddress', {}).get('address', 'N/A')
-        #            for r in msg.get('ccRecipients', [])]
-        # bcc_list = [r.get('emailAddress', {}).get('address', 'N/A')
-        #             for r in msg.get('bccRecipients', [])]
-        # body_content = single_msg_data.get("uniqueBody", {})
-        # cleaned_body = get_unique_body_outlook(body_content)
-        # inline_attachments = get_inline_attachments_outlook(body_content)
-        # attachments_data = []
-        # if msg.get('hasAttachments') or len(inline_attachments) > 0:
-        #     attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
-        #     try:
-        #         attachments_resp = requests.get(
-        #             attachments_url, headers=headers)
-        #         attachments_resp.raise_for_status()
-        #         fetched_attachments = attachments_resp.json().get('value', [])
-
-        #         for attach in fetched_attachments:
-        #             attachment_info = {
-        #                 'id': attach.get('id'),
-        #                 'name': attach.get('name'),
-        #                 'contentType': attach.get('contentType'),
-        #                 'size': attach.get('size'),
-        #                 'isInline': attach.get('isInline', False),
-        #                 'contentBytes': attach.get('contentBytes')
-        #             }
-        #             attachments_data.append(attachment_info)
-        #     except requests.exceptions.RequestException as attach_e:
-        #         print(
-        #             f"  Error fetching attachments for message {message_id}: {attach_e}")
-        #         if attach_e.response:
-        #             print(
-        #                 f"  Attachment fetch error response: {attach_e.response.text}")
-        #     received_time = convert_utc_str_to_local_datetime(
-        #         msg.get('receivedDateTime'))
-        #     # print(received_time)
-        #     message_doc = {
-        #         'message_id': message_id,
-        #         'subject': subject,
-        #         'conv_index': conv_index,
-        #         "child_replies": number_of_child_replies,
-        #         'sender': sender,
-        #         'receivers': receivers_list,
-        #         'cc': cc_list,
-        #         'bcc': bcc_list,
-        #         'body': cleaned_body,
-        #         'full_body': msg.get('body'),
-        #         'received_datetime': received_time,
-        #         'attachments': attachments_data,
-        #         'type': 'outlook_received_mail'
-        #     }
-        #     filter_query = {'conv_id': conversation_id,
-        #                     'email_address': email_address}
-
-        #     update_operations = {
-        #         '$push': {'messages': message_doc},
-        #         '$setOnInsert': {
-        #             'conv_id': conversation_id,
-        #             'email_address': email_address
-        #         }
-        #     }
-
-        #     result = inbox_conversations_collection.update_one(
-        #         filter_query, update_operations, upsert=True)
+        result, message_doc = save_single_mail(
+            msg, email_address, conversation_id, user_data)
         messages.append(message_id)
         if current_message_id == message_id:
             conduct_analysis(email_address, conversation_id, message_doc)
-                # email_data = {
-                #     'user_email':email_address,
-                #     'conv_id':conversation_id,
-                #     'msg_id':message_id,
-                #     'received_datetime':received_time.strftime("%Y-%m-%dT%H:%M:%S%:z"),
-                #     'sender':sender,
-                #     'subject':subject,
-                #     'body':cleaned_body,
-                #     'attachments':attachments_data,
-                #     'email_provider':'gmail'
-
-                # }
-
-                # choices = ['importance_score', 'replies', 'summary_and_category']
-                # thread_id = conversation_id+"---"+message_id
-                # run_analysis_agent_stateful.delay(thread_id, email_data, choices)
     if current_message_id not in messages:
         process_outlook_mail(current_message_id, email_address)
     return True
 
 
 def process_single_mail(email_address, conversation_id, message, user_data):
-    # db = get_async_db()
-    # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
     message_id = message.get('id')
     if inbox_conversations_collection.find_one({'conv_id': conversation_id, 'messages.message_id': message_id}):
         # print(f"Message with ID '{message_id}' already processed. Exiting.")
         return conversation_id, message_id
-    result, message_doc = save_single_mail(message, email_address, conversation_id, user_data)
-    # msg_endpoint = f"{BASE_ENDPOINT}/messages/{message_id}?$select=uniqueBody"
-    # single_msg_resp = requests.get(msg_endpoint, headers=headers)
-    # single_msg_resp.raise_for_status()
-    # single_msg_data = single_msg_resp.json()
+    result, message_doc = save_single_mail(
+        message, email_address, conversation_id, user_data)
 
-    # conv_index = message.get('conversationIndex')
-    # number_of_child_replies = decode_conversation_index(
-    #     message.get('conversationIndex')).get("number of replies", '')
-    # subject = message.get('subject')
-    # sender_info = message.get('sender', {}).get('emailAddress', {})
-    # sender = sender_info.get('address', 'N/A')
-    # receivers_list = [r.get('emailAddress', {}).get('address', 'N/A')
-    #                   for r in message.get('toRecipients', [])]
-    # receivers_list = [r.get('emailAddress', {}).get('address', 'N/A')
-    #                   for r in message.get('toRecipients', [])]
-    # cc_list = [r.get('emailAddress', {}).get('address', 'N/A')
-    #            for r in message.get('ccRecipients', [])]
-    # bcc_list = [r.get('emailAddress', {}).get('address', 'N/A')
-    #             for r in message.get('bccRecipients', [])]
-    # body_content = single_msg_data.get("uniqueBody", {})
-    # cleaned_body = get_unique_body_outlook(body_content)
-    # inline_attachments = get_inline_attachments_outlook(body_content)
-    # attachments_data = []
-    # if message.get('hasAttachments') or len(inline_attachments) > 0:
-    #     attachments_url = f"{BASE_ENDPOINT}/messages/{message_id}/attachments"
-    #     try:
-    #         attachments_resp = requests.get(attachments_url, headers=headers)
-    #         attachments_resp.raise_for_status()
-    #         fetched_attachments = attachments_resp.json().get('value', [])
-
-    #         for attach in fetched_attachments:
-    #             attachment_info = {
-    #                 'id': attach.get('id'),
-    #                 'name': attach.get('name'),
-    #                 'contentType': attach.get('contentType'),
-    #                 'size': attach.get('size'),
-    #                 'isInline': attach.get('isInline', False),
-    #                 'contentBytes': attach.get('contentBytes')
-    #             }
-    #             attachments_data.append(attachment_info)
-    #     except requests.exceptions.RequestException as attach_e:
-    #         print(
-    #             f"  Error fetching attachments for message {message_id}: {attach_e}")
-    #         if attach_e.response:
-    #             print(
-    #                 f"  Attachment fetch error response: {attach_e.response.text}")
-    # received_time = convert_utc_str_to_local_datetime(
-    #     message.get('receivedDateTime'))
-    # # print(received_time)
-    # message_doc = {
-    #     'message_id': message_id,
-    #     'subject': subject,
-    #     'conv_index': conv_index,
-    #     "child_replies": number_of_child_replies,
-    #     'sender': sender,
-    #     'receivers': receivers_list,
-    #     'cc': cc_list,
-    #     'bcc': bcc_list,
-    #     'body': cleaned_body,
-    #     'full_body': message.get('body'),
-    #     'received_datetime': received_time,
-    #     'attachments': attachments_data,
-    #     'type': 'outlook_received_mail',
-    #     'provider': 'outlook',
-    # }
-    # filter_query = {'conv_id': conversation_id, 'email_address': email_address}
-
-    # update_operations = {
-    #     '$push': {'messages': message_doc},
-    #     '$setOnInsert': {
-    #         'conv_id': conversation_id,
-    #         'email_address': email_address
-    #     }
-    # }
-
-    # result = inbox_conversations_collection.update_one(
-    #     filter_query, update_operations, upsert=True)
     if result.upserted_id:
         print(f"Inserted new document with _id: {result.upserted_id}")
     else:
         print("Document updated")
     conduct_analysis(email_address, conversation_id, message_doc)
-    # if celery_app:
-    #     if message_id==current_message_id or email_address!=sender:
-    #         email_data = {
-    #             'user_email':email_address,
-    #             'conv_id':conversation_id,
-    #             'msg_id':message_id,
-    #             'received_datetime':received_time.strftime("%Y-%m-%dT%H:%M:%S%:z"),
-    #             'sender':sender,
-    #             'subject':subject,
-    #             'body':cleaned_body,
-    #             'attachments':attachments_data,
-    #             'email_provider':'gmail'
-
-    #         }
-
-    #         choices = ['importance_score', 'replies', 'summary_and_category']
-    #         thread_id = conversation_id+"---"+message_id
-    #         run_analysis_agent_stateful.delay(thread_id, email_data, choices)
-    # if len(attachments_data)>0:
-    #     generate_attachment_summary.delay(conversation_id, message_id, email_address, 'outlook')
-    # generate_previous_emails_summary.delay(conversation_id, message_id, email_address)
-    # generate_importance_analysis.delay(conversation_id, message_id, email_address)
-    # generate_summary_and_replies.delay(conversation_id, message_id, email_address)
-
     return conversation_id, message_id
 
 
@@ -811,7 +499,7 @@ def save_single_mail(message, email_address, conversation_id, user_data):
     received_time = convert_utc_str_to_local_datetime(
         message.get('receivedDateTime'))
     analysis = {
-        'completed':False
+        'completed': False
     }
     # print(received_time)
     message_doc = {
@@ -829,7 +517,7 @@ def save_single_mail(message, email_address, conversation_id, user_data):
         'attachments': attachments_data,
         'type': 'outlook_received_mail',
         'provider': 'outlook',
-        "analysis":analysis
+        "analysis": analysis
     }
     filter_query = {'conv_id': conversation_id, 'email_address': email_address}
 

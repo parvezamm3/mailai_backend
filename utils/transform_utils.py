@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 import uuid
 import pytz
 
+
 def decode_conversation_index(b64_index):
     """
     Decodes the Outlook conversationIndex from a Base64 string to a
@@ -37,10 +38,11 @@ def decode_conversation_index(b64_index):
     # Convert the 5-byte timestamp to a datetime object.
     # This requires padding with zeros to make it a valid 8-byte FILETIME.
     # FILETIME is the number of 100-nanosecond intervals since Jan 1, 1601 UTC.
-    padded_timestamp = b'\x00\x00\x00' + timestamp_bytes[::-1]  # Pad and reverse bytes
+    padded_timestamp = b'\x00\x00\x00' + \
+        timestamp_bytes[::-1]  # Pad and reverse bytes
     filetime_value = int.from_bytes(padded_timestamp, byteorder='big')
     original_timestamp = datetime(1601, 1, 1, tzinfo=timezone.utc) + \
-                         timedelta(microseconds=filetime_value // 10)
+        timedelta(microseconds=filetime_value // 10)
 
     # Convert the 16-byte GUID to a readable UUID string.
     conversation_guid = str(uuid.UUID(bytes=guid_bytes))
@@ -51,7 +53,7 @@ def decode_conversation_index(b64_index):
         child_data = binary_data[22:]
         if len(child_data) % 5 != 0:
             print("Warning: Child blocks are not a multiple of 5 bytes.")
-        
+
         for i in range(0, len(child_data), 5):
             block = child_data[i:i+5]
             if len(block) == 5:
@@ -67,7 +69,7 @@ def decode_conversation_index(b64_index):
         "original_timestamp": original_timestamp.isoformat(),
         "conversation_guid": conversation_guid,
         "child_blocks": child_blocks,
-        "number of replies":len(child_blocks),
+        "number of replies": len(child_blocks),
         "raw_base64": b64_index
     }
 
@@ -84,7 +86,13 @@ def convert_utc_str_to_local_datetime(utc_datetime_string: str):
         print(f"Error parsing datetime string: {e}")
         return datetime.now()
 
+
 def convert_to_local_time(utc_datetime):
-    tz = pytz.timezone('Asia/Tokyo')
-    localize_dt = tz.localize(utc_datetime)
-    return localize_dt
+
+    if utc_datetime.tzinfo is None or utc_datetime.tzinfo.utcoffset(utc_datetime) is None:
+        utc_datetime = pytz.utc.localize(utc_datetime)
+    tokyo_tz = pytz.timezone('Asia/Tokyo')
+    # localize_dt = tz.localize(utc_datetime)
+    tokyo_datetime = utc_datetime.astimezone(tokyo_tz)
+    # print(tokyo_datetime)
+    return tokyo_datetime

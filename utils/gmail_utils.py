@@ -3,7 +3,6 @@ import os
 import json
 import re
 import base64
-import pytz
 from datetime import datetime
 from bs4 import BeautifulSoup, NavigableString
 from googleapiclient.discovery import build
@@ -11,23 +10,14 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 
-from utils.common_utils import conduct_analysis
-from utils.message_parsing import parse_email_body_and_attachments, extract_email_thread
-from utils.transform_utils import convert_to_local_time
-# Import collections from the database module
-from database import users_collection, inbox_messages_collection, draft_messages_collection, inbox_conversations_collection
-# Import configurations from the config module
-from workers.tasks import (
-    generate_attachment_summary, generate_previous_emails_summary_gmail, 
-    generate_importance_analysis, generate_summary_and_replies,
-    run_analysis_agent_stateful
-)
-import utils.gemini_utils as gemini_utils
 from config import Config
-import workers.tasks as tasks
-# from utils.llm_agent import run_analysis_agent_stateful
+from utils.common_utils import conduct_analysis
+from utils.transform_utils import convert_to_local_time
+from database import users_collection, inbox_conversations_collection
+
 # celery_app will be set dynamically from app.py
 celery_app = None
+
 
 def save_google_credentials(user_id, credentials, last_history_id=None):
     """Saves user's Google API credentials to MongoDB."""
@@ -48,7 +38,9 @@ def save_google_credentials(user_id, credentials, last_history_id=None):
         {'$set': {'credentials': update_data}},
         upsert=True
     )
-    print(f"Credentials saved/updated for user: {user_id}. History ID: {last_history_id}")
+    print(
+        f"Credentials saved/updated for user: {user_id}. History ID: {last_history_id}")
+
 
 def load_google_credentials(user_id):
     """Loads user's Google API credentials from MongoDB."""
@@ -70,12 +62,14 @@ def load_google_credentials(user_id):
             print(f"Refreshing Google token for user: {user_id}")
             try:
                 creds.refresh(Request())
-                save_google_credentials(user_id, creds, last_history_id) # Save updated credentials
+                # Save updated credentials
+                save_google_credentials(user_id, creds, last_history_id)
             except Exception as refresh_error:
                 print(f"Error refreshing token for {user_id}: {refresh_error}")
-                return None, None # Return None if refresh fails
+                return None, None  # Return None if refresh fails
         return creds, last_history_id
     return None, None
+
 
 def setup_gmail_watch(credentials, email_address):
     """Sets up a Gmail API watch request for the given email address."""
@@ -83,25 +77,30 @@ def setup_gmail_watch(credentials, email_address):
         gmail_service = build('gmail', 'v1', credentials=credentials)
         request_body = {
             'topicName': Config.GMAIL_PUB_SUB_TOPIC,
-            'labelIds': ['INBOX'] # Watch for changes in the INBOX
+            'labelIds': ['INBOX']  # Watch for changes in the INBOX
         }
-        print(f"Attempting to set up Gmail watch for {email_address} with topic: {Config.GMAIL_PUB_SUB_TOPIC}")
-        watch_response = gmail_service.users().watch(userId='me', body=request_body).execute()
+        print(
+            f"Attempting to set up Gmail watch for {email_address} with topic: {Config.GMAIL_PUB_SUB_TOPIC}")
+        watch_response = gmail_service.users().watch(
+            userId='me', body=request_body).execute()
 
         initial_history_id = watch_response.get('historyId')
         # Save the initial history ID with the user's credentials
         save_google_credentials(email_address, credentials, initial_history_id)
 
-        print(f"Gmail watch setup successful for {email_address}: {watch_response}")
+        print(
+            f"Gmail watch setup successful for {email_address}: {watch_response}")
         return True
     except HttpError as error:
         print(f"Error setting up Gmail watch for {email_address}: {error}")
         if error.resp.status == 403 and 'pubsub' in str(error):
-            print("Please ensure the Pub/Sub service account has 'Pub/Sub Publisher' role on your topic.")
+            print(
+                "Please ensure the Pub/Sub service account has 'Pub/Sub Publisher' role on your topic.")
         return False
     except Exception as e:
         print(f"An unexpected error occurred while setting up watch: {e}")
         return False
+
 
 def fetch_gmail_history(credentials, email_address, start_history_id):
     """Fetches new Gmail history (messages/changes) since a given history ID."""
@@ -122,19 +121,24 @@ def fetch_gmail_history(credentials, email_address, start_history_id):
             if messages_to_process:
                 # print(f"Processing {len(messages_to_process)} messagesAdded in history entry {entry.get('id')}.")
                 for msg_info in messages_to_process:
-                    message_id = msg_info.get('message', {}).get('id') or msg_info.get('id')
+                    message_id = msg_info.get('message', {}).get(
+                        'id') or msg_info.get('id')
                     if not message_id:
-                        print(f"Warning: Could not extract message ID from msg_info: {msg_info}. Skipping.")
+                        print(
+                            f"Warning: Could not extract message ID from msg_info: {msg_info}. Skipping.")
                         continue
                     try:
                         # Fetch the full message details (full format includes payload/headers/body)
-                        message = gmail_service.users().messages().get(userId='me', id=message_id, format='full').execute()
+                        message = gmail_service.users().messages().get(
+                            userId='me', id=message_id, format='full').execute()
                         labels = message.get('labelIds', [])
                         if 'INBOX' in labels and 'UNREAD' in labels:
-                            result, thread_id, msg_doc = save_single_mail(gmail_service, message, email_address)
+                            result, thread_id, msg_doc = save_single_mail(
+                                gmail_service, message, email_address)
 
                             if result.upserted_id:
-                                print(f"Inserted new document with _id: {result.upserted_id}")
+                                print(
+                                    f"Inserted new document with _id: {result.upserted_id}")
                             else:
                                 print(f"Document was updated.")
                             # print(f"  Processed and saved Gmail message: ID={message_id}, From='{sender}', Subject='{subject}'")
@@ -144,7 +148,7 @@ def fetch_gmail_history(credentials, email_address, start_history_id):
                             # if celery_app: # Ensure celery_app is initialized globally in app.py and passed to utils
                             #     # import workers.tasks as tasks
                             #     # print(thread_id, message_id, email_address)
-                                
+
                             #     email_data = {
                             #          'user_email':email_address,
                             #          'conv_id':thread_id,
@@ -175,10 +179,12 @@ def fetch_gmail_history(credentials, email_address, start_history_id):
                         if msg_error.resp.status == 404:
                             pass
                         else:
-                            print(f"  Error fetching message {message_id}: {msg_error}")
+                            print(
+                                f"  Error fetching message {message_id}: {msg_error}")
                     except Exception as e:
-                        print(f"  Unexpected error processing message {message_id}: {e}")
-        
+                        print(
+                            f"  Unexpected error processing message {message_id}: {e}")
+
         return history_response.get('historyId', start_history_id)
     except HttpError as error:
         print(f"Error fetching Gmail history for {email_address}: {error}")
@@ -186,7 +192,7 @@ def fetch_gmail_history(credentials, email_address, start_history_id):
     except Exception as e:
         print(f"An unexpected error occurred while fetching history: {e}")
         return start_history_id
-    
+
 
 def parse_message_parts(parts, attachments, gmail_service, message_id):
     """
@@ -195,21 +201,23 @@ def parse_message_parts(parts, attachments, gmail_service, message_id):
     pattern = r"\n+On\s+[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}.*$"
     main_body = ''
     history_body = ''
-    html_body = ''  
+    html_body = ''
     for part in parts:
         mime_type = part.get('mimeType')
         if mime_type == 'text/plain':
-            plain_text = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+            plain_text = base64.urlsafe_b64decode(
+                part['body']['data']).decode('utf-8', errors='ignore')
             match = re.search(pattern, plain_text, flags=re.MULTILINE)
 
             if match:
                 start_index = match.start()
-                
+
                 main_body = plain_text[:start_index]
                 history_body = plain_text[start_index:]
                 history_body = history_body.replace('>', '')
-                history_body = os.linesep.join([s.strip() for s in history_body.splitlines() if s])
-                
+                history_body = os.linesep.join(
+                    [s.strip() for s in history_body.splitlines() if s])
+
         if mime_type == 'text/html':
             new_content, prev_content, html_body = get_text_from_soup(part)
             if not main_body:
@@ -221,12 +229,12 @@ def parse_message_parts(parts, attachments, gmail_service, message_id):
             main_body, history_body, html_body, attachments = parse_message_parts(
                 part.get('parts', []), attachments, gmail_service, message_id
             )
-        
+
         elif part.get('filename') and part.get('filename') != '':
             if part.get('filename') in main_body or part.get('filename') not in history_body:
                 # print(part)
                 attachment_info = {
-                    'id' : part.get('body', {}).get('attachmentId'),
+                    'id': part.get('body', {}).get('attachmentId'),
                     'name': part['filename'],
                     'contentType': mime_type,
                     'size': part.get('body', {}).get('size'),
@@ -247,26 +255,31 @@ def parse_message_parts(parts, attachments, gmail_service, message_id):
                         if attachment_content_response.get('data'):
                             attachment_info['contentBytes'] = attachment_content_response['data']
                     except HttpError as attach_error:
-                        print(f"Error fetching separate attachment: {attach_error}")
+                        print(
+                            f"Error fetching separate attachment: {attach_error}")
                     except Exception as e:
-                        print(f"Unexpected error fetching separate attachment: {e}")
+                        print(
+                            f"Unexpected error fetching separate attachment: {e}")
                 # print(attachment_info.keys())
                 attachments.append(attachment_info)
-        
+
     return main_body, history_body, html_body, attachments
 
+
 def get_text_from_soup(part):
-    html_content = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+    html_content = base64.urlsafe_b64decode(
+        part['body']['data']).decode('utf-8', errors='ignore')
     soup = BeautifulSoup(html_content, 'html.parser')
-    
+
     for img_tag in soup.find_all('img', alt=True):
         alt_text = img_tag['alt']
         img_tag.replace_with('[image: '+alt_text+']')
 
     for br_tag in soup.find_all('br'):
         br_tag.replace_with('\n')
-    
-    first_quote_div = soup.find('div', class_='gmail_quote gmail_quote_container')
+
+    first_quote_div = soup.find(
+        'div', class_='gmail_quote gmail_quote_container')
     new_content = ""
     previous_content = ""
 
@@ -288,7 +301,7 @@ def get_text_from_soup(part):
 
 def prepare_conversation_thread(email_address, thread_id, current_message_id):
     credentials, last_history_id = load_google_credentials(email_address)
-    
+
     gmail_service = build('gmail', 'v1', credentials=credentials)
     try:
         thread = gmail_service.users().threads().get(
@@ -303,9 +316,11 @@ def prepare_conversation_thread(email_address, thread_id, current_message_id):
         for msg in messages:
             msg_id = msg.get('id')
             if msg_id and 'TRASH' not in msg.get('labelIds', []):
-                message = gmail_service.users().messages().get(userId='me', id=msg.get('id'), format='full').execute()
+                message = gmail_service.users().messages().get(
+                    userId='me', id=msg.get('id'), format='full').execute()
                 # print(message)
-                result, thread_id, msg_doc = save_single_mail(gmail_service, message, email_address)
+                result, thread_id, msg_doc = save_single_mail(
+                    gmail_service, message, email_address)
                 if msg_id == current_message_id:
                     conduct_analysis(email_address, thread_id, msg_doc)
             else:
@@ -314,16 +329,20 @@ def prepare_conversation_thread(email_address, thread_id, current_message_id):
     except Exception as e:
         print(f"Error occured during preparing thread for gmail {e}")
         return False
-    
+
+
 def save_single_mail(gmail_service, message, email_address):
     message_id = message['id']
     payload = message.get('payload', {})
     headers = payload.get('headers', [])
     thread_id = message['threadId']
     sender = next((h['value'] for h in headers if h['name'] == 'From'), 'N/A')
-    subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'N/A')
+    subject = next((h['value']
+                   for h in headers if h['name'] == 'Subject'), 'N/A')
+
     def get_recipients_from_header(header_name):
-        header_value = next((h['value'] for h in headers if h['name'] == header_name), '')
+        header_value = next((h['value']
+                            for h in headers if h['name'] == header_name), '')
         # Split by comma and clean up each email address
         return [addr.strip() for addr in header_value.split(',') if addr.strip()]
     receivers_list = get_recipients_from_header('To')
@@ -348,9 +367,9 @@ def save_single_mail(gmail_service, message, email_address):
     )
 
     analysis = {
-        'completed':False
+        'completed': False
     }
-    
+
     message_doc = {
         'message_id': message_id,
         'subject': subject,
@@ -359,17 +378,16 @@ def save_single_mail(gmail_service, message, email_address):
         'cc': cc_list,
         'bcc': bcc_list,
         'body': main_conv,
-        'previous_messages':prev_conv,
-        'received_datetime':localize_dt,
+        'previous_messages': prev_conv,
+        'received_datetime': localize_dt,
         'attachments': attachments,
-        'type':'gmail_received_mail',
-        'provider':'gmail',
+        'type': 'gmail_received_mail',
+        'provider': 'gmail',
         'full_message_payload': html_conv,
-        'analysis':analysis
+        'analysis': analysis
     }
-    
 
-    filter_query = {'conv_id': thread_id, 'email_address':email_address}
+    filter_query = {'conv_id': thread_id, 'email_address': email_address}
 
     update_operations = {
         '$addToSet': {'messages': message_doc},
@@ -379,7 +397,8 @@ def save_single_mail(gmail_service, message, email_address):
         }
     }
 
-    result = inbox_conversations_collection.update_one(filter_query, update_operations, upsert=True)
+    result = inbox_conversations_collection.update_one(
+        filter_query, update_operations, upsert=True)
     if result.upserted_id:
         print(f"Inserted new document with _id: {result.upserted_id}")
     else:

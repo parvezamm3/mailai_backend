@@ -14,13 +14,9 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 import aiosqlite
 import logging
 
-# Assuming these are available and async-compatible.
-# Note: You'll need to change `database.py` to use an async client like `motor`.
 from config import Config
-from app import celery_app
-from database_async import users_collection_async, inbox_conversations_collection_async 
-# from database_async import inbox_conversations_collection_async
-from utils.gemini_utils import call_gemini_api 
+from database_async import users_collection_async, inbox_conversations_collection_async
+from utils.gemini_utils import call_gemini_api
 from utils.transform_utils import convert_to_local_time
 from utils.attachment_processing import extract_text_from_attachment
 
@@ -121,6 +117,7 @@ if "GOOGLE_API_KEY" not in os.environ:
 
 gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 
+
 async def _extract_text_from_attachments(data, filename, email_provider):
     """
     Helper function to extract plain text content from attachments within the
@@ -139,38 +136,49 @@ async def _extract_text_from_attachments(data, filename, email_provider):
 
         text = await extract_text_from_attachment(decoded_bytes, filename)
         if text:
-            attachment_texts.append(f"--- Attachment: {filename} ---\n{text}\n--- End Attachment ---")
+            attachment_texts.append(
+                f"--- Attachment: {filename} ---\n{text}\n--- End Attachment ---")
     except Exception as e:
         print(f"Error processing attachment {filename}: {e}")
-    
+
     return attachment_texts
 
 # =========================================================================
 # Pydantic Models for Structured Output
 # =========================================================================
+
+
 class SpamCheckResult(BaseModel):
     """The result of the spam and malicious content check."""
     is_spam: bool = Field(..., description="True if the email is spam.")
-    is_malicious: bool = Field(..., description="True if the email contains malicious content.")
+    is_malicious: bool = Field(...,
+                               description="True if the email contains malicious content.")
+
 
 class ImportanceScoreResult(BaseModel):
     """The importance score and description for the email."""
     score: int = Field(..., description="An importance score from 0-100.")
-    description: str = Field(..., description="A short Japanese description of the score reason.")
+    description: str = Field(...,
+                             description="A short Japanese description of the score reason.")
+
 
 class ReplyOption(BaseModel):
     """A single suggested reply for the email."""
     type: Literal["Concise", "Confirm", "Polite"]
     text: str = Field(..., description="The Japanese text of the reply.")
 
+
 class RepliesResult(BaseModel):
     """A list of suggested replies for the email."""
-    replies: List[ReplyOption] = Field(..., description="A list of suggested replies.")
+    replies: List[ReplyOption] = Field(...,
+                                       description="A list of suggested replies.")
+
 
 class SummarizationAndCategoryResult(BaseModel):
     """The summary and category for the email."""
     summary: str = Field(..., description="A concise summary of the email.")
-    category: Literal["エラー", "修理", "問い合わせ", "報告", "キャンペーン", "プロモーション", "スパム", "有害", "返信不要"]
+    category: Literal["エラー", "修理", "問い合わせ", "報告",
+                      "キャンペーン", "プロモーション", "スパム", "有害", "返信不要"]
 
 
 class AgentState(TypedDict):
@@ -178,15 +186,15 @@ class AgentState(TypedDict):
     Represents the state of a single email analysis session.
     The state persists across multiple requests for the same email.
     """
-    email_provider:str
-    current_mail:dict
-    conv_id:str
-    msg_id:str
-    user_email:str
+    email_provider: str
+    current_mail: dict
+    conv_id: str
+    msg_id: str
+    user_email: str
     attachment_summaries: Optional[str]
     previous_conversation_summary: Optional[str]
-    user_choices: List[str] # List of tasks to perform if not spam
-    
+    user_choices: List[str]  # List of tasks to perform if not spam
+
     # Analysis results are updated by the nodes
     importance_score_result: Optional[dict]
     replies_result: Optional[dict]
@@ -196,6 +204,8 @@ class AgentState(TypedDict):
 # =========================================================================
 # LangGraph Nodes
 # =========================================================================
+
+
 async def generate_attachment_summary(state: AgentState):
     """
     Generates a summary for each attachment in parallel and saves it to the state.
@@ -207,11 +217,9 @@ async def generate_attachment_summary(state: AgentState):
     if not attachments:
         print("No attachments found. Skipping summary generation.")
         return {"attachment_summaries": "No Attachment"}
-    
+
     async def _summarize_single_attachment_async(conv_id, msg_id, user_id, attachment):
         """Helper function to process a single attachment asynchronously."""
-        # db = get_async_db()
-        # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
         name = attachment.get('name')
         summary = attachment.get('attachment_summary')
         if summary:
@@ -221,7 +229,8 @@ async def generate_attachment_summary(state: AgentState):
         attachment_size = attachment.get('size')
         if attachment_size < 1200000:
             extracted_text = await _extract_text_from_attachments(
-                attachment.get('contentBytes'), attachment.get('name'), state["email_provider"]
+                attachment.get('contentBytes'), attachment.get(
+                    'name'), state["email_provider"]
             )
             attachment_summary = ""
             if extracted_text:
@@ -240,7 +249,7 @@ async def generate_attachment_summary(state: AgentState):
                             },
                             {
                                 '$set': {
-                                'messages.$[message].attachments.$[attachment].attachment_summary': attachment_summary,
+                                    'messages.$[message].attachments.$[attachment].attachment_summary': attachment_summary,
                                 }
                             },
                             array_filters=[
@@ -248,10 +257,12 @@ async def generate_attachment_summary(state: AgentState):
                                 {"attachment.id": attachment_id}
                             ]
                         )
-                        print(f"DB Update: Saved summary for attachment '{attachment_id}' in thread '{conv_id}'")
+                        print(
+                            f"DB Update: Saved summary for attachment '{attachment_id}' in thread '{conv_id}'")
                         return {"name": name, "summary": attachment_summary}
                 except Exception as e:
-                    print(f"Gemini error occurred for attachment {attachment_id}: {e}")
+                    print(
+                        f"Gemini error occurred for attachment {attachment_id}: {e}")
             else:
                 print(f"Text extraction failed for attachment {attachment_id}")
         else:
@@ -265,41 +276,37 @@ async def generate_attachment_summary(state: AgentState):
 
     # Create a list of tasks to run in parallel
     tasks = [
-        _summarize_single_attachment_async(conv_id, msg_id, user_id, attachment)
+        _summarize_single_attachment_async(
+            conv_id, msg_id, user_id, attachment)
         for attachment in attachments
     ]
     # Use asyncio.gather to run all tasks concurrently
     summaries = await asyncio.gather(*tasks)
-    
-      # Filter out any failed tasks and combine the results
-    filtered_summaries_list = [s for s in summaries if s is not None]
-    attachment_summaries_text = "\n".join([f"File Name: {s['name']}\t\t Summary: {s['summary']}" for s in filtered_summaries_list])
 
-    print(f"Parallel summary generation complete. {len(filtered_summaries_list)} summaries generated.")
+    # Filter out any failed tasks and combine the results
+    filtered_summaries_list = [s for s in summaries if s is not None]
+    attachment_summaries_text = "\n".join(
+        [f"File Name: {s['name']}\t\t Summary: {s['summary']}" for s in filtered_summaries_list])
+
+    print(
+        f"Parallel summary generation complete. {len(filtered_summaries_list)} summaries generated.")
     return {"attachment_summaries": attachment_summaries_text}
 
 
-async def generate_previous_conversation_summary(state:AgentState):
+async def generate_previous_conversation_summary(state: AgentState):
     print("Generation of previous summary started")
-    # db = get_async_db()
-    # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
     current_mail = state.get('current_mail')
     if current_mail.get('previous_messages_summary'):
         return {"previous_conversation_summary": current_mail.get('previous_messages_summary')}
-    # else:
-        # try:
-        #     current_received_time = datetime.fromisoformat(state["received_datetime"])
-        # except ValueError:
-        #     current_received_time = state["received_datetime"]
     current_received_time = current_mail.get('received_datetime')
-    print(current_received_time)
+    # print(current_received_time)
     try:
         pipeline = [
-            { "$match": {
+            {"$match": {
                 "conv_id": state['conv_id'],
                 "email_address": state["user_email"]
             }},
-            { "$project": {
+            {"$project": {
                 "_id": 0,
                 "previous_messages": {
                     "$filter": {
@@ -311,54 +318,61 @@ async def generate_previous_conversation_summary(state:AgentState):
                     }
                 }
             }},
-            { "$project": {
+            {"$project": {
                 "previous_messages": {
-                "$sortArray": {
-                    "input": "$previous_messages",
-                    "sortBy": { "received_datetime": 1 }
-                }
+                    "$sortArray": {
+                        "input": "$previous_messages",
+                        "sortBy": {"received_datetime": 1}
+                    }
                 }
             }}
         ]
         # Corrected: Use await with the async database client (`motor`)
         cursor = await inbox_conversations_collection_async.aggregate(pipeline)
         result = await cursor.to_list(length=None)
-        previous_messages = result[0].get("previous_messages", []) if result else []
+        previous_messages = result[0].get(
+            "previous_messages", []) if result else []
         print(f"Previous_messages length : {len(previous_messages)}")
     except Exception as e:
         print(f"DB aggregation error: {e}")
         previous_messages = []
-    
+
     summary = ''
     if previous_messages:
         if len(previous_messages) == 1:
-            summary = previous_messages[0].get("analysis", {}).get('summary','')
+            summary = previous_messages[0].get(
+                "analysis", {}).get('summary', '')
         else:
             previous_messages_summaries = ""
             for message in previous_messages:
                 # assuming message.received_datetime is a datetime objec
-                received_time_str = convert_to_local_time(message['received_datetime']).strftime("%Y-%m-%d %H:%M:%S")
+                # print(message['received_datetime'].strftime(
+                #     "%Y-%m-%d %H:%M:%S"))
+                # print(convert_to_local_time(
+                #     message['received_datetime']).strftime("%Y-%m-%d %H:%M:%S"))
+                received_time_str = convert_to_local_time(
+                    message['received_datetime']).strftime("%Y-%m-%d %H:%M:%S")
                 logger.info("Received datetime %s", received_time_str)
-                previous_messages_summaries += f"Received Time : {received_time_str}\t\tMail Summary: {message.get("analysis", {}).get('summary','')}"
-            logger.info("previous message summaries : %s", previous_messages_summaries)
+                previous_messages_summaries += f"Received Time : {received_time_str}\t\tMail Summary: {message.get("analysis", {}).get('summary', '')}"
+            logger.info("previous message summaries : %s",
+                        previous_messages_summaries)
             if previous_messages_summaries:
                 prompt_summary = f'Summarize the key points and unresolved issues from the summaries of the previous email of this thread: {previous_messages_summaries} within 200 characters in Japanese. Only include Japanese, no Romaji.'
 
                 try:
-                    # Corrected: await the async call_gemini_api function
                     summary = await call_gemini_api(prompt_summary)
                     logger.info('Generated summary %s', summary)
                 except Exception as e:
                     print("Gemini error occured", e)
-    
+
     # Corrected: Use await with the async database client (`motor`)
     await inbox_conversations_collection_async.update_one(
         {
-            'conv_id': state['conv_id'], 'email_address': state['user_email'], 'messages.message_id':state['msg_id']
+            'conv_id': state['conv_id'], 'email_address': state['user_email'], 'messages.message_id': state['msg_id']
         },
         {
             '$set': {
-            'messages.$[message].previous_messages_summary': summary,
+                'messages.$[message].previous_messages_summary': summary,
             }
         },
         array_filters=[
@@ -369,6 +383,8 @@ async def generate_previous_conversation_summary(state:AgentState):
     return {"previous_conversation_summary": summary}
 
 # Corrected: This function is already async, no changes needed here.
+
+
 async def initial_processing_and_parallel_nodes(state: AgentState):
     """
     A single node that wraps the parallel execution of the two asynchronous
@@ -376,30 +392,32 @@ async def initial_processing_and_parallel_nodes(state: AgentState):
     step and then proceed.
     """
     print("Starting initial processing (parallel tasks)...")
-    
+
     attachment_result, previous_summary_result = await asyncio.gather(
         generate_attachment_summary(state),
         generate_previous_conversation_summary(state)
     )
-    
+
     combined_state_update = {}
     combined_state_update.update(attachment_result)
     combined_state_update.update(previous_summary_result)
-    
+
     print("All initial processing tasks completed.")
     return combined_state_update
-    
+
 # Corrected: Change this to an async function and use ainvoke
+
+
 async def check_spam_and_malicious(state: AgentState):
     """Checks if the email is spam or malicious."""
     print("Running spam check...")
     current_mail = state.get('current_mail')
     analysis = current_mail.get('analysis', {})
-    if len(analysis)!=0:
+    if len(analysis) != 0:
         cur_spam = analysis.get('is_spam')
         cur_malicious = analysis.get('is_malicious')
-        if cur_spam==False and cur_malicious==False:
-            return {"spam_check_result": {'is_spam':cur_spam, 'is_malicious':cur_malicious}}
+        if cur_spam == False and cur_malicious == False:
+            return {"spam_check_result": {'is_spam': cur_spam, 'is_malicious': cur_malicious}}
     body = current_mail.get('body')
     sender = current_mail.get('subject')
     subject = current_mail.get('subject')
@@ -412,21 +430,24 @@ async def check_spam_and_malicious(state: AgentState):
         f'Body:\n{body}\n\n'
     )
     if state.get("attachment_summaries") and state["attachment_summaries"] != "No Attachment":
-        prompt+=f'Summary Of The Attachments :\n{state["attachment_summaries"]}\n\n'
+        prompt += f'Summary Of The Attachments :\n{state["attachment_summaries"]}\n\n'
     if state.get('previous_conversation_summary'):
         prompt += f"Previous Conversation Summary:\n{state['previous_conversation_summary']}"
 
     try:
-        # gemini_llm_2 = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-        llm_with_structured_output = gemini_llm.with_structured_output(SpamCheckResult)
+        llm_with_structured_output = gemini_llm.with_structured_output(
+            SpamCheckResult)
         response = await asyncio.to_thread(llm_with_structured_output.invoke, [HumanMessage(prompt)])
         # print(response)
-        return {"spam_check_result": {'is_spam':response.is_spam, 'is_malicious':response.is_malicious}}
+        return {"spam_check_result": {'is_spam': response.is_spam, 'is_malicious': response.is_malicious}}
     except Exception as e:
-        print(f"Error invoking Gemini with structured output for spam check: {e}")
-        return {"spam_check_result": {'is_spam':False, 'is_malicious':False}}
+        print(
+            f"Error invoking Gemini with structured output for spam check: {e}")
+        return {"spam_check_result": {'is_spam': False, 'is_malicious': False}}
 
 # Corrected: These functions already use ainvoke correctly.
+
+
 async def get_importance_score(state: AgentState):
     """Assigns an importance score to the email."""
     print("Running importance score analysis...")
@@ -442,20 +463,24 @@ async def get_importance_score(state: AgentState):
         f'Body:\n{body}n\n'
     )
     if state.get("attachment_summaries"):
-        prompt+=f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
+        prompt += f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
     if state.get('previous_conversation_summary'):
         prompt += f"Previous conversation summary: {state['previous_conversation_summary']}"
     try:
-        llm_with_structured_output = gemini_llm.with_structured_output(ImportanceScoreResult)
+        llm_with_structured_output = gemini_llm.with_structured_output(
+            ImportanceScoreResult)
         response = await asyncio.to_thread(llm_with_structured_output.invoke, [HumanMessage(prompt)])
-        # print(response)
-
+        # print(convert_to_local_time(current_mail.get(
+        #     'received_datetime')).strftime("%Y-%m-%d %H:%M:%S"))
+        # print(current_mail.get('received_datetime',
+        #       datetime.today).strftime("%Y-%m-%d %H:%M:%S"))
         if response.score >= 70 and "helpdesk@ffp.co.jp" in current_mail.get('receivers', ''):
-                received_time = convert_to_local_time(current_mail.get('received_datetime')).strftime("%Y-%m-%d %H:%M:%S")
-                teams_payload = {
-                    "type": "message",
-                    "attachments": [
-                        {
+            received_time = convert_to_local_time(current_mail.get(
+                'received_datetime')).strftime("%Y-%m-%d %H:%M:%S")
+            teams_payload = {
+                "type": "message",
+                "attachments": [
+                    {
                         "contentType": "application/vnd.microsoft.card.adaptive",
                         "content": {
                             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -467,51 +492,53 @@ async def get_importance_score(state: AgentState):
                                     "text": "Critical Mail Alert",
                                     "wrap": True,
                                     "style": "heading",
-                                    "color":"attention"
+                                    "color": "attention"
                                 },
                                 {
                                     "type": "FactSet",
                                     "facts": [
                                         {
-                                        "title": "件名",
-                                        "value": f"{subject}"
+                                            "title": "件名",
+                                            "value": f"{subject}"
                                         },
                                         {
-                                        "title": "受信日時",
-                                        "value": f"{received_time}"
+                                            "title": "受信日時",
+                                            "value": f"{received_time}"
                                         },
                                         {
-                                        "title": "本文",
-                                        "value": f"{body}"
+                                            "title": "本文",
+                                            "value": f"{body}"
                                         }
                                     ]
                                 },
                             ],
                         }
                     }
-                    ]
-                }
+                ]
+            }
 
-                # Set up the headers for the request
-                teams_webhook_url = "https://prod-07.japaneast.logic.azure.com:443/workflows/7846e0ca56c44bd7a1b2aeb34ac6a4da/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=-TVc0SuSMCleLgFr2QrR2us-Jbe81poMuU3QhWHbnFo"
-                headers = {
-                    "Content-Type": "application/json"
-                }
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(teams_webhook_url, data=json.dumps(teams_payload), headers=headers) as response:
-                            response.raise_for_status()
-                            print("Message successfully sent to Teams.")
-                            return await response.text()  # or response.json() if you expect a JSON response
-                except aiohttp.ClientError as err:
-                    print(f"HTTP Error: {err}")
-                except Exception as e:
-                    print(f"An error occurred: {e}")
+            # Set up the headers for the request
+            teams_webhook_url = "https://prod-07.japaneast.logic.azure.com:443/workflows/7846e0ca56c44bd7a1b2aeb34ac6a4da/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=-TVc0SuSMCleLgFr2QrR2us-Jbe81poMuU3QhWHbnFo"
+            headers = {
+                "Content-Type": "application/json"
+            }
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(teams_webhook_url, data=json.dumps(teams_payload), headers=headers) as response:
+                        response.raise_for_status()
+                        print("Message successfully sent to Teams.")
+                        return await response.text()  # or response.json() if you expect a JSON response
+            except aiohttp.ClientError as err:
+                print(f"HTTP Error: {err}")
+            except Exception as e:
+                print(f"An error occurred: {e}")
 
-        return {"importance_score_result": {'score':response.score, 'description':response.description}}
+        return {"importance_score_result": {'score': response.score, 'description': response.description}}
     except Exception as e:
-        print(f"Error invoking Gemini with structured output for importance score: {e}")
-        return {"importance_score_result": {'score':0, 'description':"JSON parsing error"}}
+        print(
+            f"Error invoking Gemini with structured output for importance score: {e}")
+        return {"importance_score_result": {'score': 0, 'description': "JSON parsing error"}}
+
 
 async def suggest_replies(state: AgentState):
     """Suggests three business Japanese replies for the email."""
@@ -520,7 +547,6 @@ async def suggest_replies(state: AgentState):
     body = current_mail.get('body')
     sender = current_mail.get('sender')
     subject = current_mail.get('subject')
-    # print(body, sender)
     prompt = (
         f"Analyze the following email content and determine if reply needed or not."
         f"If a reply is needed, generate three reply options in Business Japanese: 'Concise', 'Confirm', and 'Polite'.\n"
@@ -533,12 +559,13 @@ async def suggest_replies(state: AgentState):
         f'Body:\n{body}\n\n'
     )
     if state.get("attachment_summaries"):
-        prompt+=f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
+        prompt += f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
     if state.get('previous_conversation_summary'):
         prompt += f"Previous conversation summary: {state['previous_conversation_summary']}"
-        
+
     try:
-        llm_with_structured_output = gemini_llm.with_structured_output(RepliesResult)
+        llm_with_structured_output = gemini_llm.with_structured_output(
+            RepliesResult)
         response = await asyncio.to_thread(llm_with_structured_output.invoke, [HumanMessage(prompt)])
         # print(response)
         replies = {}
@@ -549,6 +576,7 @@ async def suggest_replies(state: AgentState):
         print(f"Error invoking Gemini with structured output for replies: {e}")
         return {"replies_result": {}}
 
+
 async def summarize_and_categorize_email(state: AgentState):
     """Categorizes the email into a predefined category."""
     print("Running email categorization...")
@@ -556,7 +584,6 @@ async def summarize_and_categorize_email(state: AgentState):
     body = current_mail.get('body')
     sender = current_mail.get('sender')
     subject = current_mail.get('subject')
-    # print(body, sender)
     prompt = (
         f"Provide a concise summary (2-3 sentences) of the email and its context within the conversation history in Japanese."
         f"Categorize the email into one of the following categories in Japanese: "
@@ -568,17 +595,19 @@ async def summarize_and_categorize_email(state: AgentState):
         f'Body:\n{body}\n\n'
     )
     if state.get("attachment_summaries"):
-        prompt+=f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
+        prompt += f'Attachment Summaries:\n{state["attachment_summaries"]}\n\n'
     if state.get('previous_conversation_summary'):
         prompt += f"Previous conversation summary: {state['previous_conversation_summary']}"
     try:
-        llm_with_structured_output = gemini_llm.with_structured_output(SummarizationAndCategoryResult)
+        llm_with_structured_output = gemini_llm.with_structured_output(
+            SummarizationAndCategoryResult)
         response = await asyncio.to_thread(llm_with_structured_output.invoke, [HumanMessage(prompt)])
         # print(response)
-        return {"summarization_and_category_result": {'category':response.category, 'summary':response.summary}}
+        return {"summarization_and_category_result": {'category': response.category, 'summary': response.summary}}
     except Exception as e:
-        print(f"Error invoking Gemini with structured output for summary/category: {e}")
-        return {"summarization_and_category_result": {'summary':"JSON parsing error", 'category':"返信不要"}}
+        print(
+            f"Error invoking Gemini with structured output for summary/category: {e}")
+        return {"summarization_and_category_result": {'summary': "JSON parsing error", 'category': "返信不要"}}
 
 
 async def run_all_chosen_analyses(state: AgentState):
@@ -589,7 +618,7 @@ async def run_all_chosen_analyses(state: AgentState):
     print("Running chosen analyses in parallel...")
     choices = state['user_choices']
     tasks = []
-    
+
     if 'importance_score' in choices:
         tasks.append(get_importance_score(state))
     if 'replies' in choices:
@@ -605,14 +634,15 @@ async def run_all_chosen_analyses(state: AgentState):
     except Exception as e:
         logger.info("Exception: %s", e)
         return {}
-    
+
+
 def spam_router(state: AgentState) -> str:
     """
     Determines the next step based on the spam check result.
     If spam, the graph ends. Otherwise, it proceeds to other analyses.
     """
     print("Spam router")
-    print(state.get("spam_check_result"))
+    # print(state.get("spam_check_result"))
     if state.get("spam_check_result"):
         if state['spam_check_result'].get('is_spam') or state['spam_check_result'].get('is_malicious'):
             print("Spam detected. Ending analysis.")
@@ -642,7 +672,8 @@ workflow.set_entry_point("initial_processing")
 workflow.add_edge("initial_processing", "spam_check")
 
 # Add a conditional edge from the spam check node
-workflow.add_conditional_edges("spam_check", spam_router, {"end": END, "run_all_chosen_analyses": "run_all_chosen_analyses"})
+workflow.add_conditional_edges("spam_check", spam_router, {
+                               "end": END, "run_all_chosen_analyses": "run_all_chosen_analyses"})
 
 # From the user_choices_router, conditionally route to the other analysis nodes
 workflow.add_edge("run_all_chosen_analyses", END)
@@ -657,26 +688,23 @@ async def run_analysis_agent_stateful_async(thread_id: str, email_data: dict, ch
     The `thread_id` is used to load and save the state.
     """
     logger.info("Async processing started for thread_id=%s", thread_id)
-    # db = get_async_db()
-    # inbox_conversations_collection_async = db[Config.MONGO_INBOX_CONVERSATIONS_COLLECTION]
     async with aiosqlite.connect(":memory:") as conn:
         sqlite_saver = AsyncSqliteSaver(conn=conn)
-        config = {"configurable": {"thread_id": thread_id}, "checkpointer": sqlite_saver}
+        config = {"configurable": {"thread_id": thread_id},
+                  "checkpointer": sqlite_saver}
         current_mail_doc = await inbox_conversations_collection_async.find_one(
-            {'conv_id': email_data.get('conv_id'), "email_address":email_data.get('user_email'), 'messages.message_id': email_data.get('msg_id')},
+            {'conv_id': email_data.get('conv_id'), "email_address": email_data.get(
+                'user_email'), 'messages.message_id': email_data.get('msg_id')},
             {'_id': 0, 'messages.$': 1}
         )
         current_mail = current_mail_doc['messages'][0]
-        
+
         initial_state = {
-            'email_provider':email_data['email_provider'],
-            'current_mail':current_mail,
-            # 'subject': email_data['subject'],
+            'email_provider': email_data['email_provider'],
+            'current_mail': current_mail,
             'conv_id': email_data.get('conv_id'),
             'user_email': email_data.get('user_email'),
             'msg_id': email_data.get('msg_id'),
-            # 'received_datetime': email_data.get('received_datetime'),
-            # 'attachments': email_data.get('attachments', []),
             'previous_conversation_summary': None,
             'user_choices': choices if choices is not None else [],
             'attachment_summaries': None,
@@ -685,8 +713,7 @@ async def run_analysis_agent_stateful_async(thread_id: str, email_data: dict, ch
             'summarization_and_category_result': None,
             'spam_check_result': None,
         }
-        
-        # Corrected: await the ainvoke call on the agent
+
         final_state = await agent.ainvoke(initial_state, config=config)
 
         # logger.info("importance_score_result: %s", final_state.get("importance_score_result"))
@@ -696,20 +723,25 @@ async def run_analysis_agent_stateful_async(thread_id: str, email_data: dict, ch
     analyzing_results = {}
 
     if final_state.get("spam_check_result"):
-        analyzing_results["is_spam"] = final_state["spam_check_result"].get('is_spam')
-        analyzing_results["is_malicious"] = final_state["spam_check_result"].get('is_malicious')
+        analyzing_results["is_spam"] = final_state["spam_check_result"].get(
+            'is_spam')
+        analyzing_results["is_malicious"] = final_state["spam_check_result"].get(
+            'is_malicious')
     if final_state.get("importance_score_result"):
-        analyzing_results["importance_score"] = final_state["importance_score_result"].get('score')
-        analyzing_results["importance_description"] = final_state["importance_score_result"].get('description')
+        analyzing_results["importance_score"] = final_state["importance_score_result"].get(
+            'score')
+        analyzing_results["importance_description"] = final_state["importance_score_result"].get(
+            'description')
     if final_state.get("summarization_and_category_result"):
-        analyzing_results["summary"] = final_state["summarization_and_category_result"].get('summary')
-        analyzing_results["category"] = final_state["summarization_and_category_result"].get('category')
+        analyzing_results["summary"] = final_state["summarization_and_category_result"].get(
+            'summary')
+        analyzing_results["category"] = final_state["summarization_and_category_result"].get(
+            'category')
     if final_state.get("replies_result"):
         analyzing_results["replies"] = final_state["replies_result"]
     analyzing_results["completed"] = True
     if analyzing_results:
         try:
-            # Corrected: Use await with the async database client (`motor`)
             await inbox_conversations_collection_async.update_one(
                 {
                     'conv_id': final_state['conv_id'],
@@ -725,9 +757,10 @@ async def run_analysis_agent_stateful_async(thread_id: str, email_data: dict, ch
                     {"message.message_id": final_state['msg_id']}
                 ]
             )
-            print(f"DB Update: Saved analyzing_results for message '{final_state['msg_id']}'")
+            print(
+                f"DB Update: Saved analyzing_results for message '{final_state['msg_id']}'")
         except Exception as e:
             print(f"Error updating database with analyzing_results: {e}")
-    
+
     print(f"\n--- Analysis complete for thread ID: {thread_id} ---")
     return final_state
