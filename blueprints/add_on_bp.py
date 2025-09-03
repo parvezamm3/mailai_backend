@@ -14,12 +14,9 @@ from database import preferences_collection, users_collection, draft_messages_co
 from utils.outlook_utils import (
     load_outlook_credentials, send_outlook_reply_graph,
     get_application_access_token, get_outlook_access_token,
-    prepare_conversation_thread as prepare_conversation_thread_outlook, process_outlook_mail,
-    get_base_endpoint, get_url_headers
+    prepare_conversation_thread as prepare_conversation_thread_outlook
 )
 from utils.common_utils import conduct_analysis
-from utils.transform_utils import decode_conversation_index, convert_utc_str_to_local_datetime
-from utils.message_parsing import get_unique_body_outlook, get_inline_attachments_outlook
 from utils.gmail_utils import (
     load_google_credentials,
     prepare_conversation_thread as prepare_conversation_thread_gmail)
